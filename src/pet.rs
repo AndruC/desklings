@@ -94,8 +94,13 @@ impl Pet {
         self.species.info().stage
     }
 
+    /// Age at time `now`. A clock that's behind the birth time counts as no time passed.
+    pub fn age_at(&self, now: u64) -> u64 {
+        now.saturating_sub(self.born)
+    }
+
     pub fn age(&self) -> u64 {
-        now().saturating_sub(self.born)
+        self.age_at(now())
     }
 
     pub fn mistake(&mut self) {
@@ -109,19 +114,23 @@ impl Pet {
         (base as i64 + self.life_mod).max(MIN_LIFESPAN as i64) as u64
     }
 
-    pub fn life_left(&self) -> u64 {
-        self.lifespan().saturating_sub(self.age())
+    pub fn life_left_at(&self, now: u64) -> u64 {
+        self.lifespan().saturating_sub(self.age_at(now))
     }
 
     /// In its twilight years: the last 15% of its life.
+    pub fn elderly_at(&self, now: u64) -> bool {
+        self.age_at(now) * 100 >= self.lifespan() * 85
+    }
+
     pub fn elderly(&self) -> bool {
-        self.age() * 100 >= self.lifespan() * 85
+        self.elderly_at(now())
     }
 
     /// Called every second. Each full day of age earns extra lifespan, whether or not the app was
     /// running, except that every care mistake made since the last review spoils one day's bonus.
-    pub fn review_day(&mut self) {
-        let day = self.age() / DAY;
+    pub fn review_day(&mut self, now: u64) {
+        let day = self.age_at(now) / DAY;
         if day > self.care_day {
             let spoiled = self.mistakes.saturating_sub(self.mistakes_mark) as u64;
             let good_days = (day - self.care_day).saturating_sub(spoiled);
@@ -133,7 +142,7 @@ impl Pet {
 
     /// One second of life: hunger, happiness and energy drift, sleep, and care mistakes.
     /// `may_doze` is false while it's busy (battling, training) so it finishes before nodding off.
-    pub fn live_second(&mut self, may_doze: bool) -> Sleep {
+    pub fn live_second(&mut self, now: u64, may_doze: bool) -> Sleep {
         if self.stage() == Stage::Egg {
             return Sleep::Unchanged;
         }
@@ -153,7 +162,7 @@ impl Pet {
                 change = Sleep::Woke;
             }
         } else {
-            let tire = if self.elderly() { 1.5 } else { 1.0 };
+            let tire = if self.elderly_at(now) { 1.5 } else { 1.0 };
             self.energy = (self.energy - TIRE_RATE * tire).max(0.0);
             if self.energy < DOZE_BELOW && may_doze {
                 self.asleep = true;
@@ -320,7 +329,8 @@ impl Pet {
 
     /// Parses a save file. Missing keys fall back to defaults so older saves keep loading, but a
     /// file that looks damaged is an error: cut off, a value that doesn't parse, or an unknown
-    /// species. Times later than `now` (clock set back) are pulled in to `now`, not rejected.
+    /// species. Times are kept exactly as saved even if the clock is currently behind them: ages
+    /// and timers just treat that as no time passed until the clock catches up.
     pub fn parse(text: &str, now: u64) -> Result<(Pet, Option<f32>), String> {
         fn val<T: std::str::FromStr>(k: &str, v: &str) -> Result<T, String> {
             v.parse().map_err(|_| format!("bad {k}= value {v:?}"))
@@ -329,6 +339,8 @@ impl Pet {
             let f: f32 = val(k, v)?;
             if f.is_finite() { Ok(f.clamp(0.0, 100.0)) } else { Err(format!("bad {k}= value {v:?}")) }
         }
+        // Editors like Notepad add an invisible byte-order mark; it isn't part of the data.
+        let text = text.strip_prefix('\u{FEFF}').unwrap_or(text);
         // Every save ends with `saved=...` and a newline; anything else was cut off mid-write.
         if !text.ends_with('\n') {
             return Err("file ends mid-line (truncated?)".into());
@@ -389,14 +401,13 @@ impl Pet {
         }
 
         let saved = saved.ok_or("no saved= line (file truncated?)")?;
-        p.born = born.ok_or("no born= line")?.min(now);
-        p.stage_since = p.stage_since.min(now);
+        p.born = born.ok_or("no born= line")?;
         p.species = match species {
             Some(s) => s,
             // Saves from before evolution paths: carry on as whatever its age implies.
             None => {
                 p.stage_since = now;
-                match now - p.born {
+                match now.saturating_sub(p.born) {
                     0..60 => Species::Egg,
                     60..660 => Species::Blip,
                     660..4260 => Species::Blop,
@@ -447,11 +458,11 @@ impl Pet {
                 let bad = path.with_file_name(format!("state.bad.{}.txt", now()));
                 let kept = std::fs::rename(&path, &bad).is_ok() || std::fs::copy(&path, &bad).is_ok();
                 let seen = text.lines().find_map(|l| l.strip_prefix("seen=")?.parse().ok()).unwrap_or(0);
-                let note = if kept {
-                    format!("Save file was damaged ({why}); kept a copy as {}.", bad.file_name().unwrap_or_default().to_string_lossy())
-                } else {
-                    format!("Save file was damaged ({why}) and couldn't be backed up.")
-                };
+                if !kept {
+                    // Starting fresh now would overwrite the only copy at the next autosave.
+                    return Loaded::Unreadable(format!("{} is damaged ({why}) and couldn't be backed up", path.display()));
+                }
+                let note = format!("Save file was damaged ({why}); kept a copy as {}.", bad.file_name().unwrap_or_default().to_string_lossy());
                 Loaded::Damaged(Pet::new(seen), note)
             }
         }
@@ -509,10 +520,11 @@ mod tests {
         p.next_poop = NOW + 99;
         p.mistakes = 2;
         p.starving = true;
+        p.sulking = true;
         p.wins = 7;
         p.losses = 3;
         p.rank = 2;
-        p.rank_wins = 1;
+        p.rank_wins = 2;
         p.generation = 4;
         p.life_mod = -3600;
         p.care_day = 3;
@@ -528,7 +540,8 @@ mod tests {
         assert_eq!(a.serialize(123.0, NOW), b.serialize(123.0, NOW));
         // Spot-check fields directly too, in case serialize and parse both forget one.
         assert_eq!((b.species, b.stats, b.wins, b.rank, b.generation), (Species::Mystifur, [70, 50, 60, 90, 140], 7, 2, 4));
-        assert_eq!((b.poops.clone(), b.asleep, b.starving, b.life_mod, b.seen), (vec![(100, 200), (-50, 1300)], true, true, -3600, 0b1011));
+        assert_eq!((b.poops.clone(), b.asleep, b.starving, b.sulking, b.life_mod, b.seen), (vec![(100, 200), (-50, 1300)], true, true, true, -3600, 0b1011));
+        assert_eq!((b.rank_wins, b.mistakes, b.mistakes_mark, b.care_day, b.losses, b.next_poop), (2, 2, 2, 3, 3, NOW + 99));
     }
 
     #[test]
@@ -544,12 +557,12 @@ mod tests {
         let mut p = sample();
         p.asleep = false;
         p.energy = DOZE_BELOW - 1.0;
-        assert_eq!(p.live_second(false), Sleep::Unchanged);
+        assert_eq!(p.live_second(NOW, false), Sleep::Unchanged);
         assert!(!p.asleep);
-        assert_eq!(p.live_second(true), Sleep::FellAsleep);
+        assert_eq!(p.live_second(NOW, true), Sleep::FellAsleep);
         assert!(p.asleep);
         p.energy = 99.99;
-        assert_eq!(p.live_second(true), Sleep::Woke);
+        assert_eq!(p.live_second(NOW, true), Sleep::Woke);
         assert_eq!(p.energy, 100.0);
     }
 
@@ -561,11 +574,11 @@ mod tests {
         p.starving = false;
         let before = p.mistakes;
         for _ in 0..100 {
-            p.live_second(true);
+            p.live_second(NOW, true);
         }
         assert_eq!(p.mistakes, before + 1);
         p.full = 50.0;
-        p.live_second(true);
+        p.live_second(NOW, true);
         assert!(!p.starving);
     }
 
@@ -646,11 +659,23 @@ saved={NOW}
     }
 
     #[test]
-    fn clock_set_back_is_not_damage() {
+    fn clock_set_back_is_not_damage_and_doesnt_age_it() {
         let text = sample().serialize(0.0, NOW);
-        let (p, _) = Pet::parse(&text, NOW - 5 * DAY).expect("a clock behind the save must still load");
-        assert_eq!(p.born, NOW - 5 * DAY);
-        assert!(p.stage_since <= NOW - 5 * DAY);
+        let behind = NOW - 5 * DAY;
+        let (p, _) = Pet::parse(&text, behind).expect("a clock behind the save must still load");
+        assert_eq!(p.born, NOW - 3 * DAY, "birth time kept exactly as saved");
+        assert_eq!(p.stage_since, NOW - DAY);
+        assert_eq!(p.age_at(behind), 0, "clock behind: no time has passed");
+        // Saved while the clock was wrong, then loaded once it's fixed: true age, not age + skew.
+        let (again, _) = Pet::parse(&p.serialize(0.0, behind), NOW).unwrap();
+        assert_eq!(again.age_at(NOW), 3 * DAY);
+    }
+
+    #[test]
+    fn byte_order_mark_is_ignored() {
+        let text = format!("\u{FEFF}{}", sample().serialize(0.0, NOW));
+        let (p, _) = Pet::parse(&text, NOW).expect("BOM must not count as damage");
+        assert_eq!(p.born, NOW - 3 * DAY);
     }
 
     #[test]
@@ -669,7 +694,7 @@ saved={NOW}
         p.sulking = false;
         let before = p.mistakes;
         for _ in 0..100 {
-            p.live_second(true);
+            p.live_second(NOW, true);
         }
         assert_eq!(p.mistakes, before + 1);
     }
@@ -690,7 +715,7 @@ saved={NOW}
         let close = |a: f32, b: f32| (a - b).abs() < 1e-4;
         let drop = |p: &mut Pet| {
             let (f, h, e) = (p.full, p.happy, p.energy);
-            p.live_second(false);
+            p.live_second(NOW, false);
             (f - p.full, h - p.happy, e - p.energy)
         };
 
@@ -711,8 +736,8 @@ saved={NOW}
         assert!(close(df, 0.5 * FULL_RATE) && close(dh, 0.5 * HAPPY_RATE) && close(de, -REST_RATE));
 
         let mut old = fresh();
-        old.born = now() - old.lifespan() * 9 / 10; // age is measured against the real clock
-        assert!(old.elderly());
+        old.born = NOW - old.lifespan() * 9 / 10;
+        assert!(old.elderly_at(NOW));
         let (_, _, de) = drop(&mut old);
         assert!(close(de, 1.5 * TIRE_RATE), "elderly tire faster");
     }
@@ -742,37 +767,40 @@ saved={NOW}
     #[test]
     fn mistakes_spoil_good_days() {
         let mut p = Pet::new(0);
-        p.born -= DAY + 5;
+        p.born = NOW - DAY - 5;
         let base = p.lifespan();
         p.mistake();
-        p.review_day();
+        p.review_day(NOW);
         assert_eq!(p.lifespan(), base - MISTAKE_COST as u64, "a day with a mistake earns nothing");
 
         let mut gap = Pet::new(0);
-        gap.born -= 4 * DAY + 5;
+        gap.born = NOW - 4 * DAY - 5;
         let base = gap.lifespan();
         gap.mistake();
-        gap.review_day();
+        gap.review_day(NOW);
         assert_eq!(gap.lifespan(), base - MISTAKE_COST as u64 + 3 * GOOD_DAY_BONUS as u64, "4 days, 1 spoiled");
     }
 
     #[test]
     fn mistake_free_day_adds_life() {
         let mut p = Pet::new(0);
-        p.born -= DAY + 5;
+        p.born = NOW - DAY - 5;
         let base = p.lifespan();
-        p.review_day();
+        p.review_day(NOW);
         assert_eq!(p.lifespan(), base + GOOD_DAY_BONUS as u64);
-        p.review_day(); // same day: no double bonus
+        p.review_day(NOW); // same day: no double bonus
         assert_eq!(p.lifespan(), base + GOOD_DAY_BONUS as u64);
     }
 
     #[test]
     fn elderly_in_last_fifteen_percent() {
         let mut p = Pet::new(0);
-        p.born -= p.lifespan() * 80 / 100;
-        assert!(!p.elderly());
-        p.born -= p.lifespan() * 10 / 100;
-        assert!(p.elderly());
+        let at = |p: &mut Pet, pct: u64| {
+            p.born = NOW - p.lifespan() * pct / 100;
+            p.elderly_at(NOW)
+        };
+        assert!(!at(&mut p, 84));
+        assert!(at(&mut p, 85));
+        assert!(at(&mut p, 86));
     }
 }

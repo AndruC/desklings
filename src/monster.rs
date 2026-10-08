@@ -804,21 +804,26 @@ mod tests {
             .count();
         assert!(wins > 450, "won {wins}/500");
 
-        let even = (0..1000)
-            .filter(|_| {
-                let mut a = Fighter::new(Species::Raptin, [30; 5]);
-                let mut b = Fighter::new(Species::Raptin, [30; 5]);
-                fight(&mut a, &mut b, &mut rng)
-            })
+        // Identical monsters: the rules are symmetric, and striking first is an edge, not a lock.
+        let twin = || Fighter::new(Species::Raptin, [30; 5]);
+        let first_wins = (0..2000).filter(|_| fight(&mut twin(), &mut twin(), &mut rng)).count();
+        assert!((1000..=1400).contains(&first_wins), "first striker won {first_wins}/2000");
+        let alternating = (0..2000)
+            .filter(|i| if i % 2 == 0 { fight(&mut twin(), &mut twin(), &mut rng) } else { !fight(&mut twin(), &mut twin(), &mut rng) })
             .count();
-        assert!((350..=750).contains(&even), "even fight won {even}/1000");
+        assert!((900..=1100).contains(&alternating), "with turns alternating, won {alternating}/2000");
     }
 
     #[test]
     fn opponent_budget_scales_with_rank() {
         let mut rng = Rng(7);
-        let e = total(&opponent(0, &mut rng).stats);
-        let s = total(&opponent(5, &mut rng).stats);
-        assert!(e < 80 && s > 650, "E {e}, S {s}");
+        let mut last = 0;
+        for rank in 0..RANKS.len() {
+            let avg = (0..50).map(|_| total(&opponent(rank, &mut rng).stats)).sum::<u32>() / 50;
+            let budget = RANK_BUDGET[rank];
+            assert!(avg > last, "rank {} not tougher than the one below ({avg} <= {last})", RANKS[rank]);
+            assert!(avg.abs_diff(budget) * 10 <= budget, "rank {} averages {avg}, budget {budget}", RANKS[rank]);
+            last = avg;
+        }
     }
 }

@@ -36,11 +36,17 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # Safe to re-run: if an earlier attempt already made the draft, just replace its exe.
+          cd target/release
+          sha256sum desklings.exe > desklings.exe.sha256
+          # Safe to re-run while it's still a draft; a published release is never modified.
           if gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" target/release/desklings.exe --clobber
+            if [ "$(gh release view "$GITHUB_REF_NAME" --json isDraft --jq .isDraft)" != "true" ]; then
+              echo "::error::Release $GITHUB_REF_NAME is already published; refusing to replace its files"
+              exit 1
+            fi
+            gh release upload "$GITHUB_REF_NAME" desklings.exe desklings.exe.sha256 --clobber
           else
-          gh release create "$GITHUB_REF_NAME" target/release/desklings.exe --draft \
+          gh release create "$GITHUB_REF_NAME" desklings.exe desklings.exe.sha256 --draft \
             --title "Desklings $GITHUB_REF_NAME" \
             --generate-notes \
             --notes "Download **desklings.exe** below and run it. No installer needed; it saves to \`%APPDATA%\desklings\`.

@@ -20,7 +20,7 @@ The exe isn't code-signed, so Windows SmartScreen may warn you the first time. C
 - **Training:** five drills (Run, Lift, Endure, Study, Swim). Happy monsters train better, unhappy ones slack off, and sometimes you get a *Great!* session.
 - **Battles:** a wild monster walks up and the two auto-battle with HP bars. Win to climb ranks E→S.
 - **Evolution:** 16 species across Egg → Fresh → In-Training → Rookie → Champion → Ultimate. The path depends on which stats you train, how well you look after it, and how many battles it has won.
-- **Lifespan and retirement:** a monster starts with two weeks to live. Every day without a care mistake adds half a day, so a well-kept monster lives up to about four weeks. Care mistakes and overwork shorten it. Days with the app closed count as good days, so closing it for a while is never punished. Retirees enter the Hall of Fame, and the next egg inherits a tenth of their stats.
+- **Lifespan and retirement:** a monster starts with two weeks to live. Every day without a care mistake adds half a day, so a well-kept monster lives up to about four weeks. Care mistakes and overwork shorten it. Days with the app closed count as good days, so closing it for a while is never punished. Grumbloo, the neglect evolution, lives a quarter less. Time away of more than half an hour (app closed or PC asleep) counts as a full night's sleep. Retirees enter the Hall of Fame, and the next egg inherits a tenth of their stats.
 - **Saves automatically** to `%APPDATA%\desklings\`. While it's closed, needs drain gently and never fall below a safe minimum.
 
 ## Evolution tree

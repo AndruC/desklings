@@ -102,9 +102,11 @@ for i, (name, rows) in enumerate(monsters):
     d.rectangle([cx + cell_w, cy, cx + 2 * cell_w - 1, cy + cell_h + 15], fill=(235, 235, 228))
     d.text((cx + 4, cy + 2), f'{name} {len(rows[0])}x{len(rows)}', fill=(255, 255, 255))
     d.text((cx + cell_w + 4, cy + 2), 'asleep', fill=(0, 0, 0))
-    h = len(rows)
-    draw(name, rows, cx + S, cy + 16 + (24 - h) * S, pal)
-    draw(name, rows, cx + cell_w + S, cy + 16 + (24 - h) * S, pal, asleep=True)
+    # Stand it on its lowest opaque row, the way the game's blit_standing does.
+    bottom = max(i for i, r in enumerate(rows) if r.strip('.'))
+    oy = cy + 16 + (23 - bottom) * S
+    draw(name, rows, cx + S, oy, pal)
+    draw(name, rows, cx + cell_w + S, oy, pal, asleep=True)
 
 y = mrows * (cell_h + 16) + 10
 for i, (name, rows) in enumerate(icons):
