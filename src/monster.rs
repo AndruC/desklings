@@ -582,6 +582,36 @@ mod tests {
     }
 
     #[test]
+    fn sprites_are_well_formed() {
+        fn check(name: &str, spr: Sprite, (max_w, max_h): (usize, usize)) {
+            assert!(!spr.is_empty(), "{name} is empty");
+            let w = spr[0].len();
+            assert!(spr.iter().all(|r| r.len() == w), "{name} has ragged rows");
+            assert!(spr.iter().flat_map(|r| r.bytes()).all(|c| b".kwbdahepronygcs".contains(&c)), "{name} has an unknown pixel char");
+            assert!(spr.iter().any(|r| r.bytes().any(|c| c != b'.')), "{name} is blank");
+            assert!(w <= max_w && spr.len() <= max_h, "{name} is {w}x{}, over {max_w}x{max_h}", spr.len());
+        }
+        for sp in ALL_SPECIES {
+            let info = sp.info();
+            let limit = match info.stage {
+                Stage::Champion => (20, 20),
+                Stage::Ultimate => (24, 24),
+                _ => (16, 16),
+            };
+            for &frame in info.frames {
+                check(info.name, frame, limit);
+                // Frames are centred by width, so differing widths would make it jitter.
+                assert_eq!(frame[0].len(), info.frames[0][0].len(), "{} frames differ in width", info.name);
+            }
+        }
+        let icons = [HEART, MEAT, ZZZ, BANG, STAR, UP, SWEAT, SHOE, DUMBBELL, SHIELD, BOOK, WAVE, SWORD];
+        for icon in icons {
+            check("icon", icon, (7, 7));
+        }
+        check("POOP", POOP, (8, 6));
+    }
+
+    #[test]
     fn stages_follow_the_tree() {
         use Species::*;
         for sp in ALL_SPECIES {

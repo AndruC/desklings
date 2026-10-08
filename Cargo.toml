@@ -4,6 +4,7 @@ description = "A tiny monster-raising pet that lives on your Windows taskbar"
 license = "MIT"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.80"
 
 [dependencies.windows-sys]
 version = "0.59"

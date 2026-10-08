@@ -340,48 +340,12 @@ impl App {
             self.retiring = true;
             unsafe { PostMessageW(self.hwnd, WM_RETIRE, 0, 0) };
         }
-        let p = &mut self.pet;
-        if p.stage() == Stage::Egg {
-            return;
-        }
-        let slow = if p.asleep { 0.5 } else { 1.0 };
-        p.full = (p.full - FULL_RATE * slow).max(0.0);
-        let mut sad = HAPPY_RATE * (1.0 + p.poops.len() as f32);
-        if p.full < 20.0 {
-            sad *= 2.0;
-        }
-        p.happy = (p.happy - sad * slow).max(0.0);
-        if p.asleep {
-            p.energy += REST_RATE;
-            if p.energy >= 100.0 {
-                p.energy = 100.0;
-                p.asleep = false;
-                self.act = Act::Joy;
-                self.act_t = 15;
-            }
-        } else {
-            let tire = if p.elderly() { 1.5 } else { 1.0 };
-            p.energy = (p.energy - TIRE_RATE * tire).max(0.0);
-            if p.energy < 10.0 && self.battle.is_none() {
-                p.asleep = true;
-                // Reactions don't tick while asleep, so drop any pending one or it sticks.
-                self.act = Act::Idle;
-                self.act_t = 20;
-            }
-        }
-
-        // Care mistakes: letting it starve or sulk counts once per episode.
-        if p.full <= 0.0 && !p.starving {
-            p.starving = true;
-            p.mistake();
-        } else if p.full > 25.0 {
-            p.starving = false;
-        }
-        if p.happy <= 0.0 && !p.sulking {
-            p.sulking = true;
-            p.mistake();
-        } else if p.happy > 25.0 {
-            p.sulking = false;
+        let busy = self.battle.is_some() || matches!(self.act, Act::Train(_));
+        match self.pet.live_second(!busy) {
+            Sleep::Woke => self.set_act(Act::Joy, 15),
+            // Reactions don't tick while asleep, so drop any pending one or it sticks.
+            Sleep::FellAsleep => self.set_act(Act::Idle, 20),
+            Sleep::Unchanged => {}
         }
 
         // Wait until it's standing on the ground so the poop lands where it is.
@@ -391,14 +355,17 @@ impl App {
         }
         if t >= self.last_save + 60 {
             self.last_save = t;
-            self.pet.save(self.x);
+            if !self.pet.save(self.x) {
+                self.news = "Couldn't save! Check that %APPDATA%\\desklings is writable.".into();
+            }
         }
     }
 
     fn due_evolution(&self, t: u64) -> Option<Species> {
         let dur = self.pet.stage().duration()?;
         let retiring = self.pet.life_left() == 0;
-        if t < self.pet.stage_since + dur || retiring || self.battle.is_some() || self.held.is_some() {
+        let busy = self.battle.is_some() || self.held.is_some() || matches!(self.act, Act::Train(_));
+        if t < self.pet.stage_since + dur || retiring || busy {
             return None;
         }
         evolution(self.pet.species, &self.pet.stats, self.pet.mistakes, self.pet.wins)
@@ -657,24 +624,17 @@ impl App {
         unsafe { ShowWindow(self.foe_hwnd, SW_HIDE) };
         let foe = b.foe.sp.info().name;
         let rank = RANKS[self.pet.rank as usize];
-        let p = &mut self.pet;
+        let promoted = self.pet.record_battle(won);
         if won {
-            p.wins += 1;
-            p.rank_wins += 1;
-            p.happy = (p.happy + 10.0).min(100.0);
             let i = self.rng.below(5) as usize;
-            add(&mut p.stats, i, 2);
+            add(&mut self.pet.stats, i, 2);
             self.news = format!("Beat a wild {foe} (Rank {rank})! {} +2", STAT_NAMES[i]);
-            if p.rank_wins >= WINS_TO_RANK_UP && (p.rank as usize) < RANKS.len() - 1 {
-                p.rank += 1;
-                p.rank_wins = 0;
-                self.news += &format!(" Promoted to Rank {}!", RANKS[p.rank as usize]);
+            if let Some(r) = promoted {
+                self.news += &format!(" Promoted to Rank {}!", RANKS[r as usize]);
             }
             self.set_act(Act::Show(STAR), 25);
             self.hop(12.0);
         } else {
-            p.losses += 1;
-            p.happy = (p.happy - 8.0).max(0.0);
             self.news = format!("Lost to a wild {foe} (Rank {rank}). Train up and try again!");
             self.set_act(Act::Show(SWEAT), 25);
         }
@@ -696,15 +656,17 @@ impl App {
         let behind = if self.dir > 0 { CX - half - 8 } else { CX + half };
         let x = self.x as i32 + behind * s;
         let y = self.y as i32 + ch() - POOP.len() as i32 * s;
-        let (x, y) = self.spawn_poop(x, y);
-        self.pet.poops.push((x, y));
+        if let Some(landed) = self.spawn_poop(x, y) {
+            self.pet.poops.push(landed);
+        }
         if !self.busy() {
             self.set_act(Act::Walk, 30);
         }
     }
 
-    /// Creates a poop window near (x, y), snapped onto that monitor's taskbar. Returns where it landed.
-    fn spawn_poop(&mut self, x: i32, y: i32) -> (i32, i32) {
+    /// Creates a poop window near (x, y), snapped onto that monitor's taskbar. Returns where it
+    /// landed, or None if the window couldn't be created.
+    fn spawn_poop(&mut self, x: i32, y: i32) -> Option<(i32, i32)> {
         let (w, h) = self.poop_gfx.size();
         unsafe {
             let hwnd = CreateWindowExW(
@@ -721,6 +683,9 @@ impl App {
                 GetModuleHandleW(null()),
                 null(),
             );
+            if hwnd.is_null() {
+                return None;
+            }
             let wa = work_area(hwnd);
             let x = x.clamp(wa.left, (wa.right - w).max(wa.left));
             let y = wa.bottom - h;
@@ -729,7 +694,7 @@ impl App {
             // Keep the buddy in front of its mess.
             SetWindowPos(self.hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
             self.poop_wnds.push(hwnd);
-            (x, y)
+            Some((x, y))
         }
     }
 
@@ -1021,7 +986,12 @@ fn show_menu(hwnd: HWND) {
         let info = p.species.info();
         let mut lines = vec![format!("{} · {}\t{}", info.name, info.stage.name(), duration(now().saturating_sub(p.born)))];
         if p.stage() != Stage::Egg {
-            lines.push(format!("Rank {}  ({}/{} to next)\t{}W {}L", RANKS[p.rank as usize], p.rank_wins, WINS_TO_RANK_UP, p.wins, p.losses));
+            let progress = if p.rank as usize == RANKS.len() - 1 {
+                "top rank".to_string()
+            } else {
+                format!("{}/{} to next", p.rank_wins, WINS_TO_RANK_UP)
+            };
+            lines.push(format!("Rank {}  ({progress})\t{}W {}L", RANKS[p.rank as usize], p.wins, p.losses));
             lines.push(String::new());
             for i in 0..5 {
                 lines.push(format!("{}\t{}", STAT_NAMES[i], p.stats[i]));
@@ -1086,6 +1056,17 @@ fn show_menu(hwnd: HWND) {
         cmd
     };
 
+    run_command(hwnd, cmd, st.born);
+}
+
+/// Carries out a command from the menu or a WM_COMMAND message. Commands that need a dialog run
+/// it here, outside any borrow of the app; everything goes through `App::allowed`.
+fn run_command(hwnd: HWND, cmd: i32, born: u64) {
+    // A dialog may have been open a while: only act if it's still the same pet and still allowed.
+    let still_ok = |a: &App| a.pet.born == born && a.allowed(cmd);
+    if with_app(|a| still_ok(a)) != Some(true) {
+        return;
+    }
     match cmd {
         CMD_QUIT => unsafe {
             DestroyWindow(hwnd);
@@ -1112,7 +1093,7 @@ fn show_menu(hwnd: HWND) {
             let ok = unsafe { MessageBoxW(hwnd, wide(&ask).as_ptr(), wide("Retire").as_ptr(), MB_YESNO | MB_ICONQUESTION) };
             if ok == IDYES {
                 with_app(|a| {
-                    if a.pet.born == st.born && a.allowed(CMD_RETIRE) {
+                    if still_ok(a) {
                         a.retire();
                     }
                 });
@@ -1129,7 +1110,7 @@ fn show_menu(hwnd: HWND) {
             };
             if ok == IDYES {
                 with_app(|a| {
-                    if a.pet.born == st.born {
+                    if still_ok(a) {
                         a.command(CMD_RESET);
                     }
                 });
@@ -1203,6 +1184,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 with_app(|a| {
                     if a.pet.born == born {
                         a.retire();
+                    } else {
+                        a.retiring = false; // that pet is already gone; don't leave the menu locked
                     }
                 });
             }
@@ -1210,7 +1193,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         // Menu commands can also arrive as messages (handy for scripting and testing).
         WM_COMMAND => {
-            with_app(|a| a.command((wp & 0xFFFF) as i32));
+            if let Some(born) = with_app(|a| a.pet.born) {
+                run_command(hwnd, (wp & 0xFFFF) as i32, born);
+            }
             0
         }
         WM_ENDSESSION if wp != 0 => {
@@ -1339,8 +1324,9 @@ fn main() {
             last_save: now(),
         };
         for (x, y) in std::mem::take(&mut app.pet.poops) {
-            let landed = app.spawn_poop(x, y);
-            app.pet.poops.push(landed);
+            if let Some(landed) = app.spawn_poop(x, y) {
+                app.pet.poops.push(landed);
+            }
         }
         app.render();
         APP.with(|a| *a.borrow_mut() = Some(app));

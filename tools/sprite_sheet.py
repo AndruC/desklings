@@ -6,6 +6,8 @@ Requires Pillow. Palettes mirror the species table in src/monster.rs - keep them
 import pathlib, re, sys
 from PIL import Image, ImageDraw
 
+if len(sys.argv) < 3:
+    sys.exit(__doc__)
 src = open(sys.argv[1], encoding='utf-8').read()
 out = sys.argv[2]
 only = set(sys.argv[3].split(',')) if len(sys.argv) > 3 else None
@@ -17,8 +19,8 @@ for m in re.finditer(r'pub const (\w+): Sprite = &\[(.*?)\];', src, re.S):
 
 VALID = set('.kwbdahepronygcs')
 ICONS = {'HEART', 'MEAT', 'ZZZ', 'BANG', 'STAR', 'UP', 'SWEAT', 'SHOE', 'DUMBBELL', 'SHIELD', 'BOOK', 'WAVE', 'SWORD'}
-# Largest size each sprite may be (width, height); see CLAUDE.md. Icons must fit the 9x9 bubble interior.
-LIMITS = {**{n: (7, 9) for n in ICONS}, 'POOP': (8, 6)}
+# Largest size each sprite may be (width, height); keep in sync with sprites_are_well_formed in monster.rs.
+LIMITS = {**{n: (7, 7) for n in ICONS}, 'POOP': (8, 6)}
 for n in ('EGG', 'BLIP_A', 'BLIP_B', 'BLOP', 'RAPTIN', 'FLUFFIN', 'SHELLBY'):
     LIMITS[n] = (16, 16)
 for n in ('PYROREX', 'CRAGDON', 'GALEWING', 'MYSTIFUR', 'BULWARK', 'TIDECREST', 'GRUMBLOO'):

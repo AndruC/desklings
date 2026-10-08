@@ -5,7 +5,7 @@ A memory-light Windows desktop pet (Digimon / Monster Rancher–style) in Rust u
 ## Commands
 
 - `cargo build --release`: build. The running app locks `target\release\desklings.exe`, so close it first (`taskkill /IM desklings.exe` closes it gracefully and it saves; `/F` skips the save).
-- `cargo test --release`: game-rule unit tests in `monster.rs` and `pet.rs`. This does **not** rebuild the app exe, so run `cargo build` too before launching.
+- `cargo test --release`: unit tests for game rules, needs, save/load and sprite validity (`monster.rs`, `pet.rs`). This does **not** rebuild the app exe, so run `cargo build` too before launching.
 - `python tools/sprite_sheet.py src/sprites.rs docs/sprites.png`: validates sprite rows and characters and renders a preview sheet. Run it after any art change and look at the PNG.
 
 ## Architecture
@@ -18,7 +18,7 @@ A memory-light Windows desktop pet (Digimon / Monster Rancher–style) in Rust u
   - `App` lives in a `thread_local RefCell`. Always go through `with_app` (it uses `try_borrow_mut`) and **never hold the borrow across calls that pump messages**: `TrackPopupMenu`, `MessageBoxW`, `SetCapture`/`ReleaseCapture`. Build the data inside `with_app`, then call the modal API outside it. That's why retirement is announced by posting `WM_RETIRE` instead of opening a box mid-tick.
   - A 100 ms `WM_TIMER` drives `tick()`. `second()` runs once per second for needs, evolution, ageing and autosave (every 60 s).
   - Menu command IDs are also accepted as `WM_COMMAND`, which is useful for scripted testing.
-- `src/sprites.rs` is art as `&[&str]` grids, one char per pixel. The legend is at the top of the file. Monsters face **right**; the renderer mirrors them. Eyes use `he`/`kk` so they close when asleep. Sprites are anchored by their lowest opaque row and centred on `Surface.cx`. Size limits: Rookie 16×16, Champion 20×20, Ultimate 24×24, icons 7×7.
+- `src/sprites.rs` is art as `&[&str]` grids, one char per pixel. The legend is at the top of the file. Monsters face **right**; the renderer mirrors them. Eyes use `he`/`kk` so they close when asleep. Sprites are anchored by their lowest opaque row and centred on `Surface.cx`. Size limits: Rookie 16×16, Champion 20×20, Ultimate 24×24, icons 7×7, enforced by the `sprites_are_well_formed` test.
 
 ## Conventions
 

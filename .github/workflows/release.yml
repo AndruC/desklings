@@ -17,7 +17,7 @@ jobs:
       - name: Check the tag matches Cargo.toml
         shell: bash
         run: |
-          version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          version=$(cargo pkgid | sed -E 's/.*[#@]//')
           if [ "$GITHUB_REF_NAME" != "v$version" ]; then
             echo "::error::Tag $GITHUB_REF_NAME doesn't match Cargo.toml version $version"
             exit 1
@@ -29,14 +29,17 @@ jobs:
       - name: Build
         run: cargo build --release --locked
 
+      # Created as a draft and only made public once the exe is attached, so nobody sees a
+      # release without its download.
       - name: Publish release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" target/release/desklings.exe \
+          gh release create "$GITHUB_REF_NAME" target/release/desklings.exe --draft \
             --title "Desklings $GITHUB_REF_NAME" \
             --generate-notes \
             --notes "Download **desklings.exe** below and run it. No installer needed; it saves to \`%APPDATA%\desklings\`.
 
           Windows may show a SmartScreen warning because the exe isn't code-signed: click **More info → Run anyway**."
+          gh release edit "$GITHUB_REF_NAME" --draft=false
