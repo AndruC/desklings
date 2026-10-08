@@ -15,10 +15,11 @@ pub fn total(s: &Stats) -> u32 {
     s.iter().map(|&v| v as u32).sum()
 }
 
-fn add(stats: &mut Stats, i: usize, n: u16) -> u16 {
+/// Raises a stat (capped at STAT_MAX) and returns how much it actually went up.
+pub fn add(stats: &mut Stats, i: usize, n: u16) -> u16 {
     let before = stats[i];
     stats[i] = stats[i].saturating_add(n).min(STAT_MAX);
-    stats[i] - before
+    stats[i].saturating_sub(before)
 }
 
 /// Small xorshift PRNG — plenty for wandering, training rolls and battles.
@@ -353,21 +354,37 @@ pub fn evolution(sp: Species, s: &Stats, mistakes: u32, wins: u32) -> Option<Spe
     })
 }
 
-/// Player-facing description of where `sp` can go next.
-pub fn paths(sp: Species) -> &'static str {
+/// Whether `sp` has any evolution at all, given perfect stats and care.
+pub fn can_evolve(sp: Species) -> bool {
+    evolution(sp, &[STAT_MAX; 5], 0, u32::MAX).is_some()
+}
+
+/// Player-facing description of where `sp` can go next, built from the same thresholds
+/// `evolution` uses so the two can't drift apart.
+pub fn paths(sp: Species) -> String {
     use Species::*;
+    let dud = format!("Grumbloo if {CHAMPION_DUD_MISTAKES}+ care mistakes or total stats under {CHAMPION_MIN_TOTAL}");
+    let rookie = |a: &str, b: &str, hi: &str, lo: &str| {
+        format!("After 1 day as a Rookie:\n  • {a} if {hi} ≥ {lo}\n  • {b} if {lo} > {hi}\n  • {dud}")
+    };
+    let champion = |into: &str| {
+        format!(
+            "After 2 days as a Champion, becomes {into} with {ULTIMATE_MIN_TOTAL}+ total stats, \
+             {ULTIMATE_MIN_WINS}+ battle wins and no more than {ULTIMATE_MAX_MISTAKES} care mistakes."
+        )
+    };
     match sp {
-        Egg => "Hatches into Blip.",
-        Blip => "Grows into Blop.",
-        Blop => "Becomes a Rookie based on its best stat:\n  • Power → Raptin\n  • Speed or Wisdom → Fluffin\n  • Defense or Life → Shellby",
-        Raptin => "After 1 day as a Rookie:\n  • Pyrorex if Power ≥ Defense\n  • Cragdon if Defense > Power\n  • Grumbloo if 5+ care mistakes or total stats under 150",
-        Fluffin => "After 1 day as a Rookie:\n  • Galewing if Speed ≥ Wisdom\n  • Mystifur if Wisdom > Speed\n  • Grumbloo if 5+ care mistakes or total stats under 150",
-        Shellby => "After 1 day as a Rookie:\n  • Bulwark if Defense ≥ Life\n  • Tidecrest if Life > Defense\n  • Grumbloo if 5+ care mistakes or total stats under 150",
-        Pyrorex | Cragdon => "After 2 days as a Champion, becomes Infernax with 500+ total stats, 5+ battle wins and no more than 3 care mistakes.",
-        Galewing | Mystifur => "After 2 days as a Champion, becomes Seraphox with 500+ total stats, 5+ battle wins and no more than 3 care mistakes.",
-        Bulwark | Tidecrest => "After 2 days as a Champion, becomes Titanshell with 500+ total stats, 5+ battle wins and no more than 3 care mistakes.",
-        Grumbloo => "A dead end... but a happy one. Start over to try another path.",
-        Infernax | Seraphox | Titanshell => "Fully evolved. Keep training and climb to Rank S!",
+        Egg => "Hatches into Blip.".into(),
+        Blip => "Grows into Blop.".into(),
+        Blop => "Becomes a Rookie based on its best stat:\n  • Power → Raptin\n  • Speed or Wisdom → Fluffin\n  • Defense or Life → Shellby".into(),
+        Raptin => rookie("Pyrorex", "Cragdon", "Power", "Defense"),
+        Fluffin => rookie("Galewing", "Mystifur", "Speed", "Wisdom"),
+        Shellby => rookie("Bulwark", "Tidecrest", "Defense", "Life"),
+        Pyrorex | Cragdon => champion("Infernax"),
+        Galewing | Mystifur => champion("Seraphox"),
+        Bulwark | Tidecrest => champion("Titanshell"),
+        Grumbloo => "A dead end... but a happy one. Start over to try another path.".into(),
+        Infernax | Seraphox | Titanshell => "Fully evolved. Keep training and climb to Rank S!".into(),
     }
 }
 
@@ -525,15 +542,83 @@ pub fn attack(a: &Fighter, d: &Fighter, rng: &mut Rng) -> Hit {
     if crit { Hit::Crit(dmg) } else { Hit::Hit(dmg) }
 }
 
+pub const MAX_TURNS: u32 = 40;
+
+/// The faster monster strikes first; ties go to `me`.
+pub fn strikes_first(me: &Fighter, foe: &Fighter) -> bool {
+    me.stats[SPD] >= foe.stats[SPD]
+}
+
+/// One turn: `atk` attacks `def`, whose HP drops on a hit.
+pub fn strike(atk: &Fighter, def: &mut Fighter, rng: &mut Rng) -> Hit {
+    let hit = attack(atk, def, rng);
+    if let Hit::Hit(d) | Hit::Crit(d) = hit {
+        def.hp -= d;
+    }
+    hit
+}
+
+/// `Some(won)` once the battle is over: a knockout, or after MAX_TURNS whoever has the larger
+/// share of their HP left (ties go to `me`).
+pub fn outcome(me: &Fighter, foe: &Fighter, turns: u32) -> Option<bool> {
+    if me.hp > 0 && foe.hp > 0 && turns < MAX_TURNS {
+        return None;
+    }
+    let share = |f: &Fighter| f.hp.max(0) as i64 * 1_000_000 / f.max_hp.max(1) as i64;
+    Some(foe.hp <= 0 || (me.hp > 0 && share(me) >= share(foe)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn info_table_matches_enum_order() {
-        for sp in ALL_SPECIES {
-            assert_eq!(Species::from_name(sp.info().name), Some(sp));
+        for (i, sp) in ALL_SPECIES.iter().enumerate() {
+            assert_eq!(*sp as usize, i, "ALL_SPECIES out of order");
+            assert_eq!(sp.info().name, format!("{sp:?}"), "INFO row {i} describes the wrong species");
+            assert_eq!(Species::from_name(sp.info().name), Some(*sp));
         }
+    }
+
+    #[test]
+    fn stages_follow_the_tree() {
+        use Species::*;
+        for sp in ALL_SPECIES {
+            let Some(next) = evolution(sp, &[STAT_MAX; 5], 0, u32::MAX) else { continue };
+            assert!(next.info().stage > sp.info().stage, "{sp:?} -> {next:?} doesn't move up a stage");
+        }
+        assert!(!can_evolve(Grumbloo) && !can_evolve(Infernax));
+        assert!(can_evolve(Blop) && can_evolve(Pyrorex));
+    }
+
+    #[test]
+    fn guide_text_uses_the_real_thresholds() {
+        let rookie = paths(Species::Raptin);
+        assert!(rookie.contains(&format!("{CHAMPION_DUD_MISTAKES}+ care mistakes")));
+        assert!(rookie.contains(&format!("under {CHAMPION_MIN_TOTAL}")));
+        let champ = paths(Species::Galewing);
+        assert!(champ.contains(&format!("{ULTIMATE_MIN_TOTAL}+ total")));
+        assert!(champ.contains(&format!("{ULTIMATE_MIN_WINS}+ battle wins")));
+        assert!(champ.contains(&format!("more than {ULTIMATE_MAX_MISTAKES} care")));
+    }
+
+    #[test]
+    fn stat_gain_never_underflows() {
+        let mut s = [1200, 998, 0, 0, 0];
+        assert_eq!(add(&mut s, 0, 5), 0);
+        assert_eq!(add(&mut s, 1, 5), 1);
+        assert_eq!(s[..2], [999, 999]);
+    }
+
+    #[test]
+    fn battle_outcome_rules() {
+        let f = |hp: i32, max: i32| Fighter { sp: Species::Raptin, stats: [10; 5], hp, max_hp: max };
+        assert_eq!(outcome(&f(10, 50), &f(10, 50), 3), None, "still going");
+        assert_eq!(outcome(&f(10, 50), &f(0, 50), 3), Some(true), "KO");
+        assert_eq!(outcome(&f(-4, 50), &f(1, 50), 3), Some(false), "knocked out");
+        assert_eq!(outcome(&f(30, 100), &f(20, 50), MAX_TURNS), Some(false), "30% < 40% at time-out");
+        assert_eq!(outcome(&f(40, 100), &f(20, 50), MAX_TURNS), Some(true), "tie at time-out goes to me");
     }
 
     #[test]
@@ -584,18 +669,15 @@ mod tests {
     }
 
     fn fight(a: &mut Fighter, b: &mut Fighter, rng: &mut Rng) -> bool {
-        let mut a_turn = a.stats[SPD] >= b.stats[SPD];
-        for _ in 0..40 {
-            let (atk, def) = if a_turn { (&*a, &mut *b) } else { (&*b, &mut *a) };
-            if let Hit::Hit(d) | Hit::Crit(d) = attack(atk, def, rng) {
-                def.hp -= d;
-            }
-            if a.hp <= 0 || b.hp <= 0 {
-                break;
+        let mut a_turn = strikes_first(a, b);
+        for turn in 1.. {
+            if a_turn { strike(a, b, rng) } else { strike(b, a, rng) };
+            if let Some(won) = outcome(a, b, turn) {
+                return won;
             }
             a_turn = !a_turn;
         }
-        b.hp <= 0
+        unreachable!()
     }
 
     #[test]

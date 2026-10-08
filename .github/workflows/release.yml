@@ -14,11 +14,20 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - name: Check the tag matches Cargo.toml
+        shell: bash
+        run: |
+          version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          if [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME doesn't match Cargo.toml version $version"
+            exit 1
+          fi
+
       - name: Test
-        run: cargo test --release
+        run: cargo test --release --locked
 
       - name: Build
-        run: cargo build --release
+        run: cargo build --release --locked
 
       - name: Publish release
         shell: bash

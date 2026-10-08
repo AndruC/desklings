@@ -3,7 +3,7 @@
 Usage: python tools/sprite_sheet.py src/sprites.rs docs/sprites.png [NAME,NAME,...]
 Requires Pillow. Palettes mirror the species table in src/monster.rs - keep them in sync.
 """
-import re, sys
+import pathlib, re, sys
 from PIL import Image, ImageDraw
 
 src = open(sys.argv[1], encoding='utf-8').read()
@@ -16,8 +16,24 @@ for m in re.finditer(r'pub const (\w+): Sprite = &\[(.*?)\];', src, re.S):
     sprites.append((m.group(1), rows))
 
 VALID = set('.kwbdahepronygcs')
+ICONS = {'HEART', 'MEAT', 'ZZZ', 'BANG', 'STAR', 'UP', 'SWEAT', 'SHOE', 'DUMBBELL', 'SHIELD', 'BOOK', 'WAVE', 'SWORD'}
+# Largest size each sprite may be (width, height); see CLAUDE.md. Icons must fit the 9x9 bubble interior.
+LIMITS = {**{n: (7, 9) for n in ICONS}, 'POOP': (8, 6)}
+for n in ('EGG', 'BLIP_A', 'BLIP_B', 'BLOP', 'RAPTIN', 'FLUFFIN', 'SHELLBY'):
+    LIMITS[n] = (16, 16)
+for n in ('PYROREX', 'CRAGDON', 'GALEWING', 'MYSTIFUR', 'BULWARK', 'TIDECREST', 'GRUMBLOO'):
+    LIMITS[n] = (20, 20)
+for n in ('INFERNAX', 'SERAPHOX', 'TITANSHELL'):
+    LIMITS[n] = (24, 24)
+
 ok = True
 for name, rows in sprites:
+    if not rows:
+        print(f'{name} is empty'); ok = False; continue
+    if name not in LIMITS:
+        print(f'{name} has no size limit in LIMITS; add one'); ok = False
+    elif len(rows[0]) > LIMITS[name][0] or len(rows) > LIMITS[name][1]:
+        print(f'{name} is {len(rows[0])}x{len(rows)}, over the {LIMITS[name][0]}x{LIMITS[name][1]} limit'); ok = False
     w = len(rows[0])
     for i, r in enumerate(rows):
         if len(r) != w:
@@ -28,28 +44,16 @@ for name, rows in sprites:
 if not ok:
     sys.exit(1)
 
+# Species palettes come straight from the species table so the preview can't drift from the game.
+monster_rs = open(pathlib.Path(sys.argv[1]).with_name('monster.rs'), encoding='utf-8').read()
 PAL = {
-    'EGG': (0xFF6BCB77,) * 3,
-    'BLIP': (0xFF7AC8FF, 0xFFC8E8FF, 0xFF7AC8FF),
-    'BLOP': (0xFFB58CFF, 0xFFE4D4FF, 0xFFB58CFF),
-    'RAPTIN': (0xFFFF9442, 0xFFFFE0A8, 0xFFFF9442),
-    'FLUFFIN': (0xFFFFE08A, 0xFFFFFFFF, 0xFFFF9EC4),
-    'SHELLBY': (0xFF7BD389, 0xFFF4E3A1, 0xFF3E8E7E),
-    'PYROREX': (0xFFE8503A, 0xFFFFD08A, 0xFFFFB627),
-    'CRAGDON': (0xFF9A98A8, 0xFFD9C7A3, 0xFF5E5C6E),
-    'GALEWING': (0xFF4FA3F7, 0xFFE6F4FF, 0xFFFFC234),
-    'MYSTIFUR': (0xFFC9A0FF, 0xFFFFFFFF, 0xFF3B3B98),
-    'BULWARK': (0xFF5DAE5B, 0xFFF1D98A, 0xFF8A5A2B),
-    'TIDECREST': (0xFF2EC4B6, 0xFFDFF7F3, 0xFF1B6CA8),
-    'GRUMBLOO': (0xFF9BC53D, 0xFFD4E79E, 0xFF6A4C93),
-    'INFERNAX': (0xFFB22C2C, 0xFFFFC56B, 0xFF4A1942),
-    'SERAPHOX': (0xFFF7F3FF, 0xFFFFE9A8, 0xFFFFD34D),
-    'TITANSHELL': (0xFF6E8B3D, 0xFFE8D8A8, 0xFF8C8C9C),
+    m.group(1).upper(): tuple(int(c, 16) for c in m.group(2, 3, 4))
+    for m in re.finditer(r'name: "(\w+)",.*?pal: pal\((0x\w+), (0x\w+), (0x\w+)\)', monster_rs, re.S)
 }
+if len(PAL) != 16:
+    sys.exit(f'expected 16 palettes in monster.rs, found {len(PAL)}')
 FIXED = {'k': 0xFF1A1A2E, 'w': 0xFFFFFFFF, 'p': 0xFFFF8FA3, 'r': 0xFFE63946, 'o': 0xFFC8553D,
          'n': 0xFF8B5A2B, 'y': 0xFFFFD166, 'g': 0xFF57CC99, 'c': 0xFF4CC9F0, 's': 0xFFB8C0CC}
-ICONS = {'HEART', 'MEAT', 'ZZZ', 'BANG', 'STAR', 'UP', 'SWEAT', 'SHOE', 'DUMBBELL', 'SHIELD', 'BOOK', 'WAVE', 'SWORD'}
-
 
 def rgb(c):
     return ((c >> 16) & 255, (c >> 8) & 255, c & 255)

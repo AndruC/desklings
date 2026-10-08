@@ -110,31 +110,51 @@ impl Pet {
         self.age() * 100 >= self.lifespan() * 85
     }
 
-    /// Called every second: a full day of age without a new care mistake earns extra lifespan.
+    /// Called every second. Each full day of age earns extra lifespan, whether or not the app was
+    /// running, except that every care mistake made since the last review spoils one day's bonus.
     pub fn review_day(&mut self) {
         let day = self.age() / DAY;
         if day > self.care_day {
-            if self.mistakes == self.mistakes_mark {
-                self.life_mod += GOOD_DAY_BONUS;
-            }
+            let spoiled = self.mistakes.saturating_sub(self.mistakes_mark) as u64;
+            let good_days = (day - self.care_day).saturating_sub(spoiled);
+            self.life_mod += GOOD_DAY_BONUS * good_days as i64;
             self.care_day = day;
             self.mistakes_mark = self.mistakes;
         }
     }
 
-    fn path() -> Option<std::path::PathBuf> {
+    /// Needs drift for time the pet wasn't being simulated (app closed, PC asleep): half-speed drain
+    /// that never starves it below 15, and a long enough gap counts as a full night's sleep.
+    pub fn catch_up(&mut self, secs: u64) {
+        if self.stage() == Stage::Egg {
+            return;
+        }
+        let away = secs as f32;
+        self.full = (self.full - away * FULL_RATE * 0.5).max(self.full.min(15.0));
+        self.happy = (self.happy - away * HAPPY_RATE * 0.5).max(self.happy.min(15.0));
+        if secs > 1800 {
+            self.energy = 100.0;
+            self.asleep = false;
+        }
+    }
+
+    fn dir() -> Option<std::path::PathBuf> {
         let appdata = std::path::PathBuf::from(std::env::var_os("APPDATA")?);
         let dir = appdata.join("desklings");
         let old = appdata.join("digidesktop"); // the project's original name
-        if !dir.exists() && old.exists() {
-            let _ = std::fs::rename(&old, &dir);
+        if !dir.exists() && old.exists() && std::fs::rename(&old, &dir).is_err() {
+            return Some(old); // couldn't move it: keep using it rather than orphaning the save
         }
         std::fs::create_dir_all(&dir).ok()?;
-        Some(dir.join("state.txt"))
+        Some(dir)
+    }
+
+    fn path() -> Option<std::path::PathBuf> {
+        Some(Pet::dir()?.join("state.txt"))
     }
 
     fn hall_path() -> Option<std::path::PathBuf> {
-        Some(Pet::path()?.with_file_name("halloffame.txt"))
+        Some(Pet::dir()?.join("halloffame.txt"))
     }
 
     /// Adds this monster to the Hall of Fame file.
@@ -165,12 +185,20 @@ impl Pet {
         text.lines().rev().take(limit).map(str::to_string).collect()
     }
 
+    /// Writes the save atomically: a crash mid-write leaves the previous save intact.
     pub fn save(&self, x: f32) {
         let Some(path) = Pet::path() else { return };
+        let tmp = path.with_extension("tmp");
+        if std::fs::write(&tmp, self.serialize(x, now())).is_ok() {
+            let _ = std::fs::rename(&tmp, &path); // replaces the old file in one step
+        }
+    }
+
+    pub fn serialize(&self, x: f32, now: u64) -> String {
         let poops: Vec<String> = self.poops.iter().map(|(x, y)| format!("{x}:{y}")).collect();
         let stats: Vec<String> = self.stats.iter().map(|v| v.to_string()).collect();
         let flags = self.starving as u8 | (self.sulking as u8) << 1;
-        let s = format!(
+        format!(
             "born={}\nspecies={}\nstage_since={}\nstats={}\nfull={}\nhappy={}\nenergy={}\npoops={}\nasleep={}\n\
              next_poop={}\nmistakes={}\nflags={}\nwins={}\nlosses={}\nrank={}\nrank_wins={}\nseen={}\n\
              generation={}\nlife_mod={}\ncare_day={}\nmistakes_mark={}\nx={}\nsaved={}\n",
@@ -196,31 +224,33 @@ impl Pet {
             self.care_day,
             self.mistakes_mark,
             x,
-            now()
-        );
-        let _ = std::fs::write(path, s);
+            now
+        )
     }
 
-    /// Loads the saved pet and applies a gentle catch-up for the time it was closed.
-    pub fn load() -> Option<(Pet, Option<f32>)> {
-        let text = std::fs::read_to_string(Pet::path()?).ok()?;
+    /// Parses a save file. Missing keys fall back to defaults so older saves keep loading, but a
+    /// file that looks damaged (cut off, impossible birth time, unknown species) is an error.
+    pub fn parse(text: &str, now: u64) -> Result<(Pet, Option<f32>), String> {
         let mut p = Pet::new(0);
-        let (mut species, mut seen, mut x, mut saved) = (None, None, None, now());
+        let (mut born, mut species, mut seen, mut x, mut saved) = (None, None, None, None, None);
+        let num = |v: &str, default: f32| v.parse::<f32>().ok().filter(|f| f.is_finite()).unwrap_or(default).clamp(0.0, 100.0);
         for line in text.lines() {
             let Some((k, v)) = line.split_once('=') else { continue };
             match k {
-                "born" => p.born = v.parse().ok()?,
-                "species" => species = Species::from_name(v),
+                "born" => born = v.parse::<u64>().ok(),
+                "species" => species = Some(Species::from_name(v).ok_or_else(|| format!("unknown species {v:?}"))?),
                 "stage_since" => p.stage_since = v.parse().unwrap_or(p.stage_since),
                 "stats" => {
                     let s: Vec<u16> = v.split(',').filter_map(|n| n.parse().ok()).collect();
                     if s.len() == 5 {
-                        p.stats.copy_from_slice(&s);
+                        for (dst, src) in p.stats.iter_mut().zip(s) {
+                            *dst = src.min(STAT_MAX);
+                        }
                     }
                 }
-                "full" => p.full = v.parse().unwrap_or(p.full),
-                "happy" => p.happy = v.parse().unwrap_or(p.happy),
-                "energy" => p.energy = v.parse().unwrap_or(p.energy),
+                "full" => p.full = num(v, p.full),
+                "happy" => p.happy = num(v, p.happy),
+                "energy" => p.energy = num(v, p.energy),
                 "poops" => {
                     p.poops = v
                         .split(',')
@@ -242,22 +272,25 @@ impl Pet {
                 "rank" => p.rank = v.parse::<u8>().unwrap_or(0).min(RANKS.len() as u8 - 1),
                 "rank_wins" => p.rank_wins = v.parse().unwrap_or(0),
                 "seen" => seen = v.parse().ok(),
-                "generation" => p.generation = v.parse().unwrap_or(1),
+                "generation" => p.generation = v.parse().unwrap_or(1).max(1),
                 "life_mod" => p.life_mod = v.parse().unwrap_or(0),
                 "care_day" => p.care_day = v.parse().unwrap_or(0),
                 "mistakes_mark" => p.mistakes_mark = v.parse().unwrap_or(0),
-                "x" => x = v.parse().ok(),
-                "saved" => saved = v.parse().unwrap_or(saved),
+                "x" => x = v.parse::<f32>().ok().filter(|f| f.is_finite()),
+                "saved" => saved = v.parse::<u64>().ok(),
                 _ => {}
             }
         }
 
+        // `saved` is always written last, so without it the file was cut off mid-write.
+        let saved = saved.ok_or("no saved= line (file truncated?)")?;
+        p.born = born.filter(|&b| b <= now).ok_or("missing or impossible born=")?;
         p.species = match species {
             Some(s) => s,
             // Saves from before evolution paths: carry on as whatever its age implies.
             None => {
-                p.stage_since = now();
-                match now().saturating_sub(p.born) {
+                p.stage_since = now;
+                match now - p.born {
                     0..60 => Species::Egg,
                     60..660 => Species::Blip,
                     660..4260 => Species::Blop,
@@ -269,18 +302,23 @@ impl Pet {
             let line = [Species::Egg, Species::Blip, Species::Blop];
             line.iter().filter(|s| s.info().stage <= p.stage()).fold(p.species.bit(), |m, s| m | s.bit())
         });
+        p.catch_up(now.saturating_sub(saved));
+        Ok((p, x))
+    }
 
-        let away = now().saturating_sub(saved) as f32;
-        if p.stage() != Stage::Egg {
-            // Half-speed drain while away, and never starve it below 15 just for being closed.
-            p.full = (p.full - away * FULL_RATE * 0.5).max(p.full.min(15.0));
-            p.happy = (p.happy - away * HAPPY_RATE * 0.5).max(p.happy.min(15.0));
-            if away > 1800.0 {
-                p.energy = 100.0;
-                p.asleep = false;
+    /// Loads the saved pet. A damaged save is kept aside as `state.bad.txt` (never overwritten)
+    /// and a new egg starts instead, keeping the collection if it can be read. The message says why.
+    pub fn load() -> (Pet, Option<f32>, Option<String>) {
+        let Some(path) = Pet::path() else { return (Pet::new(0), None, None) };
+        let Ok(text) = std::fs::read_to_string(&path) else { return (Pet::new(0), None, None) };
+        match Pet::parse(&text, now()) {
+            Ok((p, x)) => (p, x, None),
+            Err(why) => {
+                let _ = std::fs::rename(&path, path.with_file_name("state.bad.txt"));
+                let seen = text.lines().find_map(|l| l.strip_prefix("seen=")?.parse().ok()).unwrap_or(0);
+                (Pet::new(seen), None, Some(format!("Save file was damaged ({why}); kept as state.bad.txt.")))
             }
         }
-        Some((p, x))
     }
 }
 
@@ -310,6 +348,116 @@ mod tests {
             p.mistake();
         }
         assert_eq!(p.lifespan(), MIN_LIFESPAN);
+    }
+
+    const NOW: u64 = 1_800_000_000;
+
+    fn sample() -> Pet {
+        let mut p = Pet::new(0b1011);
+        p.born = NOW - 3 * DAY;
+        p.species = Species::Mystifur;
+        p.stage_since = NOW - DAY;
+        p.stats = [70, 50, 60, 90, 140];
+        p.full = 42.5;
+        p.happy = 77.0;
+        p.energy = 31.0;
+        p.poops = vec![(100, 200), (-50, 1300)];
+        p.asleep = true;
+        p.next_poop = NOW + 99;
+        p.mistakes = 2;
+        p.starving = true;
+        p.wins = 7;
+        p.losses = 3;
+        p.rank = 2;
+        p.rank_wins = 1;
+        p.generation = 4;
+        p.life_mod = -3600;
+        p.care_day = 3;
+        p.mistakes_mark = 2;
+        p
+    }
+
+    #[test]
+    fn save_round_trips() {
+        let a = sample();
+        let (b, x) = Pet::parse(&a.serialize(123.0, NOW), NOW).unwrap();
+        assert_eq!(x, Some(123.0));
+        assert_eq!(a.serialize(123.0, NOW), b.serialize(123.0, NOW));
+    }
+
+    #[test]
+    fn truncated_or_garbage_saves_are_rejected() {
+        let text = sample().serialize(0.0, NOW);
+        let cut = &text[..text.find("saved=").unwrap()];
+        assert!(Pet::parse(cut, NOW).is_err(), "cut-off file must not load");
+        assert!(Pet::parse("", NOW).is_err());
+        assert!(Pet::parse("born=17", NOW).is_err());
+        let future = text.replace(&format!("born={}", NOW - 3 * DAY), &format!("born={}", NOW + 10));
+        assert!(Pet::parse(&future, NOW).is_err());
+        let renamed = text.replace("species=Mystifur", "species=Mystimon");
+        assert!(Pet::parse(&renamed, NOW).is_err(), "unknown species must not be treated as a legacy save");
+    }
+
+    #[test]
+    fn legacy_save_still_loads() {
+        // The very first save format: no species, stats or record.
+        let born = NOW - 2 * 3600;
+        let text = format!("born={born}
+full=50
+happy=60
+energy=70
+poops=10:20
+asleep=0
+next_poop=0
+x=5
+saved={NOW}
+");
+        let (p, x) = Pet::parse(&text, NOW).unwrap();
+        assert_eq!(p.species, Species::Raptin);
+        assert_eq!(p.stats, [10; 5]);
+        assert_eq!(p.poops, vec![(10, 20)]);
+        assert_eq!(x, Some(5.0));
+        assert_ne!(p.seen & Species::Blop.bit(), 0);
+    }
+
+    #[test]
+    fn loaded_values_are_clamped() {
+        let text = sample().serialize(0.0, NOW).replace("stats=70,50,60,90,140", "stats=1200,5,65535,0,999").replace("full=42.5", "full=NaN").replace("happy=77", "happy=-5");
+        let (p, _) = Pet::parse(&text, NOW).unwrap();
+        assert_eq!(p.stats, [999, 5, 999, 0, 999]);
+        assert_eq!(p.full, 80.0);
+        assert_eq!(p.happy, 0.0);
+    }
+
+    #[test]
+    fn time_away_drains_gently() {
+        let mut p = sample();
+        p.full = 90.0;
+        p.catch_up(10 * DAY);
+        assert_eq!(p.full, 15.0);
+        assert_eq!(p.energy, 100.0);
+        assert!(!p.asleep);
+        let mut low = sample();
+        low.happy = 5.0;
+        low.catch_up(DAY);
+        assert_eq!(low.happy, 5.0, "already below the floor: left alone");
+    }
+
+    #[test]
+    fn mistakes_spoil_good_days() {
+        let mut p = Pet::new(0);
+        p.born -= DAY + 5;
+        let base = p.lifespan();
+        p.mistake();
+        p.review_day();
+        assert_eq!(p.lifespan(), base - MISTAKE_COST as u64, "a day with a mistake earns nothing");
+
+        let mut gap = Pet::new(0);
+        gap.born -= 4 * DAY + 5;
+        let base = gap.lifespan();
+        gap.mistake();
+        gap.review_day();
+        assert_eq!(gap.lifespan(), base - MISTAKE_COST as u64 + 3 * GOOD_DAY_BONUS as u64, "4 days, 1 spoiled");
     }
 
     #[test]

@@ -36,6 +36,8 @@ fn ch() -> i32 {
     LH * scale()
 }
 const TICK_MS: u32 = 100;
+/// Gaps longer than this (PC asleep, clock jump) are handled like time away instead of replayed.
+const CATCH_UP_LIMIT: u64 = 120;
 
 /// Posted to the buddy window when its lifespan runs out, so the farewell box opens outside the tick.
 const WM_RETIRE: u32 = WM_APP + 1;
@@ -67,7 +69,7 @@ struct Surface {
 }
 
 impl Surface {
-    fn new(lw: i32, lh: i32) -> Surface {
+    fn new(lw: i32, lh: i32) -> Option<Surface> {
         unsafe {
             let dc = CreateCompatibleDC(null_mut());
             let mut bmi: BITMAPINFO = std::mem::zeroed();
@@ -79,8 +81,11 @@ impl Surface {
             bmi.bmiHeader.biCompression = BI_RGB;
             let mut bits: *mut c_void = null_mut();
             let bmp = CreateDIBSection(dc, &bmi, DIB_RGB_COLORS, &mut bits, null_mut(), 0);
+            if dc.is_null() || bmp.is_null() || bits.is_null() {
+                return None;
+            }
             SelectObject(dc, bmp);
-            Surface { dc, bits: bits as *mut u32, lw, lh, cx: CX }
+            Some(Surface { dc, bits: bits as *mut u32, lw, lh, cx: CX })
         }
     }
 
@@ -235,6 +240,8 @@ struct App {
     dragged: bool,
     rng: Rng,
     retiring: bool, // retirement announced, waiting for the message box
+    last_second: u64,
+    last_save: u64,
 }
 
 thread_local! {
@@ -303,6 +310,25 @@ impl App {
         self.pet.asleep || self.battle.is_some() || matches!(self.act, Act::Train(_))
     }
 
+    /// The single source of truth for what the player may do right now. The menu greys out
+    /// whatever this rejects and `command` refuses it, so scripted WM_COMMANDs obey it too.
+    fn allowed(&self, cmd: i32) -> bool {
+        let p = &self.pet;
+        let scene = self.battle.is_some() || matches!(self.act, Act::Train(_)) || self.retiring;
+        let free = !p.asleep && p.stage() != Stage::Egg && !scene;
+        match cmd {
+            CMD_FEED | CMD_PLAY => free,
+            c if (CMD_TRAIN..CMD_TRAIN + Drill::ALL.len() as i32).contains(&c) => free,
+            CMD_BATTLE => free && p.stage() >= Stage::InTraining,
+            CMD_CLEAN => !p.poops.is_empty(),
+            CMD_SLEEP => p.stage() != Stage::Egg && !scene,
+            CMD_RETIRE => !scene && p.stage() >= Stage::Rookie,
+            CMD_RESET => !scene,
+            CMD_GUIDE | CMD_HALL | CMD_QUIT => true,
+            _ => false,
+        }
+    }
+
     /// Once per second: evolution, ageing, needs, care mistakes, poop, autosave.
     fn second(&mut self) {
         let t = now();
@@ -338,6 +364,9 @@ impl App {
             p.energy = (p.energy - TIRE_RATE * tire).max(0.0);
             if p.energy < 10.0 && self.battle.is_none() {
                 p.asleep = true;
+                // Reactions don't tick while asleep, so drop any pending one or it sticks.
+                self.act = Act::Idle;
+                self.act_t = 20;
             }
         }
 
@@ -360,7 +389,8 @@ impl App {
             self.pet.next_poop = 0;
             self.drop_poop();
         }
-        if t % 60 == 0 {
+        if t >= self.last_save + 60 {
+            self.last_save = t;
             self.pet.save(self.x);
         }
     }
@@ -411,8 +441,19 @@ impl App {
 
     fn tick(&mut self) {
         self.frame = self.frame.wrapping_add(1);
-        if self.frame % (1000 / TICK_MS) == 0 {
-            self.second();
+        // Timers drift and stop while the PC sleeps, so run per-second logic off the clock.
+        let t = now();
+        if t != self.last_second {
+            let gap = t.saturating_sub(self.last_second);
+            self.last_second = t;
+            if gap > CATCH_UP_LIMIT {
+                self.pet.catch_up(gap); // long pause: treat it like time away
+                self.second();
+            } else {
+                for _ in 0..gap {
+                    self.second();
+                }
+            }
         }
         self.evo_flash = self.evo_flash.saturating_sub(1);
         if self.battle.is_some() {
@@ -546,7 +587,7 @@ impl App {
         self.y = ground;
         self.vy = 0.0;
         self.battle = Some(Battle {
-            my_turn: me.stats[SPD] >= foe.stats[SPD],
+            my_turn: strikes_first(&me, &foe),
             me,
             foe,
             side,
@@ -595,22 +636,17 @@ impl App {
 
         let hit = if b.my_turn {
             b.lunge.0 = 3;
-            attack(&b.me, &b.foe, &mut self.rng)
+            strike(&b.me, &mut b.foe, &mut self.rng)
         } else {
             b.lunge.1 = 3;
-            attack(&b.foe, &b.me, &mut self.rng)
+            strike(&b.foe, &mut b.me, &mut self.rng)
         };
-        if let Hit::Hit(d) | Hit::Crit(d) = hit {
-            let crit = matches!(hit, Hit::Crit(_));
-            let (target, flash) = if b.my_turn { (&mut b.foe, &mut b.flash.1) } else { (&mut b.me, &mut b.flash.0) };
-            target.hp -= d;
-            *flash = if crit { 6 } else { 3 };
+        if let Hit::Hit(_) | Hit::Crit(_) = hit {
+            let flash = if b.my_turn { &mut b.flash.1 } else { &mut b.flash.0 };
+            *flash = if matches!(hit, Hit::Crit(_)) { 6 } else { 3 };
         }
         b.my_turn = !b.my_turn;
-
-        if b.me.hp <= 0 || b.foe.hp <= 0 || b.turns >= 40 {
-            // Out of turns: whoever has more of their HP left wins.
-            let won = b.foe.hp <= 0 || (b.me.hp > 0 && b.me.hp * b.foe.max_hp >= b.foe.hp * b.me.max_hp);
+        if let Some(won) = outcome(&b.me, &b.foe, b.turns) {
             b.result = Some(won);
             b.end_t = 25;
         }
@@ -627,7 +663,7 @@ impl App {
             p.rank_wins += 1;
             p.happy = (p.happy + 10.0).min(100.0);
             let i = self.rng.below(5) as usize;
-            p.stats[i] = (p.stats[i] + 2).min(STAT_MAX);
+            add(&mut p.stats, i, 2);
             self.news = format!("Beat a wild {foe} (Rank {rank})! {} +2", STAT_NAMES[i]);
             if p.rank_wins >= WINS_TO_RANK_UP && (p.rank as usize) < RANKS.len() - 1 {
                 p.rank += 1;
@@ -769,8 +805,8 @@ impl App {
         let needy = info.stage != Stage::Egg && blink;
         let icon = match self.act {
             _ if result_icon.is_some() => result_icon,
-            Act::Show(icon) => Some(icon),
             _ if asleep => Some(ZZZ),
+            Act::Show(icon) => Some(icon),
             Act::Battle => None,
             Act::Eat => Some(MEAT),
             Act::Joy => Some(HEART),
@@ -828,6 +864,9 @@ impl App {
     }
 
     fn command(&mut self, cmd: i32) {
+        if !self.allowed(cmd) {
+            return;
+        }
         if let Some(&d) = Drill::ALL.get((cmd - CMD_TRAIN) as usize) {
             return self.start_training(d);
         }
@@ -864,6 +903,8 @@ impl App {
             }
             CMD_RESET => {
                 self.clean_all();
+                self.battle = None;
+                unsafe { ShowWindow(self.foe_hwnd, SW_HIDE) };
                 self.pet = Pet::new(self.pet.seen);
                 self.news.clear();
                 self.set_act(Act::Idle, 20);
@@ -903,6 +944,7 @@ impl App {
         let t = now();
         let next = match p.stage().duration() {
             None => "Fully evolved.".to_string(),
+            Some(_) if !can_evolve(p.species) => "This is its final form.".into(),
             Some(d) if t < p.stage_since + d => format!("Next evolution in {}.", duration(p.stage_since + d - t)),
             Some(_) if evolution(p.species, &p.stats, p.mistakes, p.wins).is_none() => {
                 "Old enough to evolve — still missing a requirement.".into()
@@ -967,11 +1009,10 @@ fn hearts(v: f32) -> String {
 
 struct MenuState {
     lines: Vec<String>,
+    enabled: Vec<i32>,
     asleep: bool,
-    stage: Stage,
-    poops: usize,
-    busy: bool,
     rank: &'static str,
+    born: u64, // identifies the pet, so a confirmation box can't act on its successor
 }
 
 fn show_menu(hwnd: HWND) {
@@ -999,17 +1040,16 @@ fn show_menu(hwnd: HWND) {
         }
         MenuState {
             lines,
+            enabled: (0..CMD_TRAIN + Drill::ALL.len() as i32).filter(|&c| a.allowed(c)).collect(),
             asleep: p.asleep,
-            stage: p.stage(),
-            poops: p.poops.len(),
-            busy: a.battle.is_some() || matches!(a.act, Act::Train(_)),
             rank: RANKS[p.rank as usize],
+            born: p.born,
         }
     }) else {
         return;
     };
 
-    let gray = |off: bool| if off { MF_GRAYED } else { 0 };
+    let gray = |cmd: i32| if st.enabled.contains(&cmd) { 0 } else { MF_GRAYED };
     let cmd = unsafe {
         let m = CreatePopupMenu();
         for l in &st.lines {
@@ -1020,24 +1060,23 @@ fn show_menu(hwnd: HWND) {
             }
         }
         AppendMenuW(m, MF_SEPARATOR, 0, null());
-        let idle = st.asleep || st.busy || st.stage == Stage::Egg;
-        AppendMenuW(m, MF_STRING | gray(idle), CMD_FEED as usize, wide("Feed").as_ptr());
+        AppendMenuW(m, MF_STRING | gray(CMD_FEED), CMD_FEED as usize, wide("Feed").as_ptr());
         let train = CreatePopupMenu();
         for (i, d) in Drill::ALL.iter().enumerate() {
             AppendMenuW(train, MF_STRING, (CMD_TRAIN + i as i32) as usize, wide(d.label()).as_ptr());
         }
-        AppendMenuW(m, MF_POPUP | gray(idle), train as usize, wide("Train").as_ptr());
+        AppendMenuW(m, MF_POPUP | gray(CMD_TRAIN), train as usize, wide("Train").as_ptr());
         let battle = format!("Battle (Rank {})", st.rank);
-        AppendMenuW(m, MF_STRING | gray(idle || st.stage < Stage::InTraining), CMD_BATTLE as usize, wide(&battle).as_ptr());
-        AppendMenuW(m, MF_STRING | gray(idle), CMD_PLAY as usize, wide("Play").as_ptr());
-        AppendMenuW(m, MF_STRING | gray(st.poops == 0), CMD_CLEAN as usize, wide("Clean up").as_ptr());
+        AppendMenuW(m, MF_STRING | gray(CMD_BATTLE), CMD_BATTLE as usize, wide(&battle).as_ptr());
+        AppendMenuW(m, MF_STRING | gray(CMD_PLAY), CMD_PLAY as usize, wide("Play").as_ptr());
+        AppendMenuW(m, MF_STRING | gray(CMD_CLEAN), CMD_CLEAN as usize, wide("Clean up").as_ptr());
         let sleep_lbl = if st.asleep { "Wake up" } else { "Lights out" };
-        AppendMenuW(m, MF_STRING | gray(st.busy || st.stage == Stage::Egg), CMD_SLEEP as usize, wide(sleep_lbl).as_ptr());
+        AppendMenuW(m, MF_STRING | gray(CMD_SLEEP), CMD_SLEEP as usize, wide(sleep_lbl).as_ptr());
         AppendMenuW(m, MF_SEPARATOR, 0, null());
         AppendMenuW(m, MF_STRING, CMD_GUIDE as usize, wide("Evolution guide…").as_ptr());
         AppendMenuW(m, MF_STRING, CMD_HALL as usize, wide("Hall of Fame…").as_ptr());
-        AppendMenuW(m, MF_STRING | gray(st.busy || st.stage < Stage::Rookie), CMD_RETIRE as usize, wide("Retire…").as_ptr());
-        AppendMenuW(m, MF_STRING, CMD_RESET as usize, wide("Start over…").as_ptr());
+        AppendMenuW(m, MF_STRING | gray(CMD_RETIRE), CMD_RETIRE as usize, wide("Retire…").as_ptr());
+        AppendMenuW(m, MF_STRING | gray(CMD_RESET), CMD_RESET as usize, wide("Start over…").as_ptr());
         AppendMenuW(m, MF_STRING, CMD_QUIT as usize, wide("Quit").as_ptr());
         let pt = cursor();
         SetForegroundWindow(hwnd);
@@ -1072,7 +1111,11 @@ fn show_menu(hwnd: HWND) {
             );
             let ok = unsafe { MessageBoxW(hwnd, wide(&ask).as_ptr(), wide("Retire").as_ptr(), MB_YESNO | MB_ICONQUESTION) };
             if ok == IDYES {
-                with_app(|a| a.retire());
+                with_app(|a| {
+                    if a.pet.born == st.born && a.allowed(CMD_RETIRE) {
+                        a.retire();
+                    }
+                });
             }
         }
         CMD_RESET => {
@@ -1085,7 +1128,11 @@ fn show_menu(hwnd: HWND) {
                 )
             };
             if ok == IDYES {
-                with_app(|a| a.command(CMD_RESET));
+                with_app(|a| {
+                    if a.pet.born == st.born {
+                        a.command(CMD_RESET);
+                    }
+                });
             }
         }
         c => {
@@ -1151,15 +1198,23 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             0
         }
         WM_RETIRE => {
-            if let Some(text) = with_app(|a| a.farewell()) {
+            if let Some((text, born)) = with_app(|a| (a.farewell(), a.pet.born)) {
                 MessageBoxW(hwnd, wide(&text).as_ptr(), wide("A long life").as_ptr(), MB_OK | MB_ICONINFORMATION);
-                with_app(|a| a.retire());
+                with_app(|a| {
+                    if a.pet.born == born {
+                        a.retire();
+                    }
+                });
             }
             0
         }
         // Menu commands can also arrive as messages (handy for scripting and testing).
         WM_COMMAND => {
             with_app(|a| a.command((wp & 0xFFFF) as i32));
+            0
+        }
+        WM_ENDSESSION if wp != 0 => {
+            with_app(|a| a.pet.save(a.x));
             0
         }
         WM_DESTROY => {
@@ -1249,21 +1304,25 @@ fn main() {
         }
 
         // Poop art never changes, so draw it once and reuse it for every poop window.
-        let mut poop_gfx = Surface::new(POOP[0].len() as i32, POOP.len() as i32);
+        let (Some(mut poop_gfx), Some(canvas), Some(foe_canvas)) =
+            (Surface::new(POOP[0].len() as i32, POOP.len() as i32), Surface::new(LW, LH), Surface::new(LW, LH))
+        else {
+            return;
+        };
         poop_gfx.blit(POOP, 0, 0, false, Pal::default(), false, false);
 
         let wa = work_area(hwnd);
-        let (pet, saved_x) = Pet::load().unwrap_or_else(|| (Pet::new(0), None));
+        let (pet, saved_x, warning) = Pet::load();
         let mut app = App {
             hwnd,
-            canvas: Surface::new(LW, LH),
+            canvas,
             poop_gfx,
             poop_wnds: Vec::new(),
             foe_hwnd,
-            foe_canvas: Surface::new(LW, LH),
+            foe_canvas,
             battle: None,
             pet,
-            news: String::new(),
+            news: warning.unwrap_or_default(),
             x: saved_x.unwrap_or((wa.right - cw() - 200) as f32),
             y: (wa.bottom - ch() - 150) as f32, // drop in from a little above the taskbar
             vy: 0.0,
@@ -1276,6 +1335,8 @@ fn main() {
             dragged: false,
             rng: Rng(now() | 1),
             retiring: false,
+            last_second: now(),
+            last_save: now(),
         };
         for (x, y) in std::mem::take(&mut app.pet.poops) {
             let landed = app.spawn_poop(x, y);
