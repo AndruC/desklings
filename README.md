@@ -1,4 +1,4 @@
-# digidesktop
+# Desklings
 
 A tiny Digimon / Monster Rancher–style pet that lives on your Windows taskbar. Feed it, train it, battle wild monsters, and steer it down one of several evolution paths. When its life runs out it retires to the Hall of Fame, and its egg carries some of its strength into the next generation.
 
@@ -15,7 +15,7 @@ It's a single ~200 KB native executable written in Rust against raw Win32 APIs. 
 - **Battles:** a wild monster walks up and the two auto-battle with HP bars. Win to climb ranks E→S.
 - **Evolution:** 16 species across Egg → Fresh → In-Training → Rookie → Champion → Ultimate. The path depends on which stats you train, how well you look after it, and how many battles it has won.
 - **Lifespan and retirement:** about two weeks per monster. Good care stretches it, while neglect and overwork shorten it. Retirees enter the Hall of Fame, and the next egg inherits a tenth of their stats.
-- **Saves automatically** to `%APPDATA%\digidesktop\`. While it's closed, needs drain gently and never fall below a safe minimum.
+- **Saves automatically** to `%APPDATA%\desklings\`. While it's closed, needs drain gently and never fall below a safe minimum.
 
 ## Evolution tree
 
@@ -55,7 +55,7 @@ Requires Windows and a Rust toolchain (stable, 2021 edition).
 
 ```sh
 cargo build --release
-target\release\digidesktop.exe
+target\release\desklings.exe
 cargo test   # game-rule unit tests
 ```
 
@@ -73,9 +73,13 @@ Only one copy runs at a time. To start it with Windows, put a shortcut to the ex
 
 ## Save files
 
-Saves live in `%APPDATA%\digidesktop\`:
+Saves live in `%APPDATA%\desklings\`:
 
 - `state.txt` is the current pet, as plain `key=value` lines.
 - `halloffame.txt` has one line per retired monster.
 
 Delete `state.txt` to start completely fresh.
+
+## License
+
+MIT. See [LICENSE](LICENSE).

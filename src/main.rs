@@ -40,8 +40,8 @@ const TICK_MS: u32 = 100;
 /// Posted to the buddy window when its lifespan runs out, so the farewell box opens outside the tick.
 const WM_RETIRE: u32 = WM_APP + 1;
 
-const POOP_CLASS: &str = "DigiDesktopPoop";
-const FOE_CLASS: &str = "DigiDesktopFoe";
+const POOP_CLASS: &str = "DesklingsPoop";
+const FOE_CLASS: &str = "DesklingsFoe";
 
 const INK: u32 = 0xFF1A1A2E;
 const WHITE: u32 = 0xFFFFFFFF;
@@ -1080,7 +1080,7 @@ fn show_menu(hwnd: HWND) {
                 MessageBoxW(
                     hwnd,
                     wide("Say goodbye and start over with a new egg?\n(Your list of monsters raised is kept.)").as_ptr(),
-                    wide("digidesktop").as_ptr(),
+                    wide("desklings").as_ptr(),
                     MB_YESNO | MB_ICONQUESTION,
                 )
             };
@@ -1201,7 +1201,7 @@ unsafe fn popup(class: &[u16], hinst: HINSTANCE, w: i32, h: i32) -> HWND {
     CreateWindowExW(
         WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
         class.as_ptr(),
-        wide("digidesktop").as_ptr(),
+        wide("desklings").as_ptr(),
         WS_POPUP,
         0,
         0,
@@ -1216,7 +1216,7 @@ unsafe fn popup(class: &[u16], hinst: HINSTANCE, w: i32, h: i32) -> HWND {
 
 fn main() {
     unsafe {
-        CreateMutexW(null(), 1, wide("Local\\digidesktop-buddy").as_ptr());
+        CreateMutexW(null(), 1, wide("Local\\desklings").as_ptr());
         if GetLastError() == ERROR_ALREADY_EXISTS {
             return;
         }
@@ -1226,7 +1226,7 @@ fn main() {
         SCALE.store(((4 * GetDpiForSystem() + 48) / 96).max(1) as i32, Relaxed);
 
         let hinst = GetModuleHandleW(null());
-        let class = wide("DigiDesktopBuddy");
+        let class = wide("DesklingsBuddy");
         let poop_class = wide(POOP_CLASS);
         let foe_class = wide(FOE_CLASS);
         let mut wc: WNDCLASSW = std::mem::zeroed();

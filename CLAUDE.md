@@ -4,7 +4,7 @@ A memory-light Windows desktop pet (Digimon / Monster Rancher–style) in Rust u
 
 ## Commands
 
-- `cargo build --release`: build. The running app locks `target\release\digidesktop.exe`, so close it first (`taskkill /IM digidesktop.exe` closes it gracefully and it saves; `/F` skips the save).
+- `cargo build --release`: build. The running app locks `target\release\desklings.exe`, so close it first (`taskkill /IM desklings.exe` closes it gracefully and it saves; `/F` skips the save).
 - `cargo test --release`: game-rule unit tests in `monster.rs` and `pet.rs`. This does **not** rebuild the app exe, so run `cargo build` too before launching.
 - `python tools/sprite_sheet.py src/sprites.rs docs/sprites.png`: validates sprite rows and characters and renders a preview sheet. Run it after any art change and look at the PNG.
 
@@ -28,4 +28,4 @@ A memory-light Windows desktop pet (Digimon / Monster Rancher–style) in Rust u
 
 ## Testing in the real app
 
-GUI changes need a look at the actual window. A screen capture must use `BitBlt` with `CAPTUREBLT` (0x40CC0020) or layered windows won't show. To test a scenario, back up `%APPDATA%\digidesktop\state.txt`, edit it (e.g. `species=`, `stats=`, `born=`, `stage_since=`), launch, post `WM_COMMAND` IDs (Battle = 7, Train = 20–24) to the `DigiDesktopBuddy` window, capture, then restore the backup. Find windows with `EnumWindows` + class name. From PowerShell, `FindWindowW(cls, $null)` passes `""` and fails.
+GUI changes need a look at the actual window. A screen capture must use `BitBlt` with `CAPTUREBLT` (0x40CC0020) or layered windows won't show. To test a scenario, back up `%APPDATA%\desklings\state.txt`, edit it (e.g. `species=`, `stats=`, `born=`, `stage_since=`), launch, post `WM_COMMAND` IDs (Battle = 7, Train = 20–24) to the `DesklingsBuddy` window, capture, then restore the backup. Find windows with `EnumWindows` + class name. From PowerShell, `FindWindowW(cls, $null)` passes `""` and fails.

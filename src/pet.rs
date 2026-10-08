@@ -123,7 +123,12 @@ impl Pet {
     }
 
     fn path() -> Option<std::path::PathBuf> {
-        let dir = std::path::PathBuf::from(std::env::var_os("APPDATA")?).join("digidesktop");
+        let appdata = std::path::PathBuf::from(std::env::var_os("APPDATA")?);
+        let dir = appdata.join("desklings");
+        let old = appdata.join("digidesktop"); // the project's original name
+        if !dir.exists() && old.exists() {
+            let _ = std::fs::rename(&old, &dir);
+        }
         std::fs::create_dir_all(&dir).ok()?;
         Some(dir.join("state.txt"))
     }
