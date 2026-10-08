@@ -19,7 +19,8 @@ use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Threading::CreateMutexW;
 use windows_sys::Win32::UI::HiDpi::*;
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
+use windows_sys::Win32::System::SystemInformation::GetTickCount;
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, ReleaseCapture, SetCapture, LASTINPUTINFO};
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 // Logical canvas (in art pixels): up to 24x24 monster on the left, speech bubble top-right.
@@ -38,6 +39,8 @@ fn ch() -> i32 {
     LH * scale()
 }
 const TICK_MS: u32 = 100;
+/// No keyboard or mouse input for this long (screensaver, locked, stepped away) counts as away.
+const AWAY_AFTER_MS: u32 = 10 * 60 * 1000;
 
 /// Posted to the buddy window when its lifespan runs out, so the farewell box opens outside the tick.
 const WM_RETIRE: u32 = WM_APP + 1;
@@ -264,6 +267,14 @@ fn work_area(hwnd: HWND) -> RECT {
     }
 }
 
+/// Nobody has touched the keyboard or mouse for a while.
+fn user_away() -> bool {
+    unsafe {
+        let mut lii = LASTINPUTINFO { cbSize: size_of::<LASTINPUTINFO>() as u32, dwTime: 0 };
+        GetLastInputInfo(&mut lii) != 0 && GetTickCount().wrapping_sub(lii.dwTime) >= AWAY_AFTER_MS
+    }
+}
+
 fn sprite_width(spr: Sprite) -> i32 {
     spr.iter().map(|r| r.len()).max().unwrap_or(0) as i32
 }
@@ -325,7 +336,7 @@ impl App {
         // Timers drift and stop while the PC sleeps, so run per-second logic off the clock.
         let t = now();
         if t != self.last_second {
-            let ev = self.game.advance(self.last_second, t, self.on_ground());
+            let ev = self.game.advance(self.last_second, t, self.on_ground(), user_away());
             self.last_second = t;
             self.handle(ev);
             if t >= self.last_save + 60 || t < self.last_save {

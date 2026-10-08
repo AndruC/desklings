@@ -111,6 +111,7 @@ pub struct Game {
     pub news: String, // last training / battle result, shown in the menu
     pub retiring: bool,
     pub evo_flash: u32,
+    dozed_while_away: bool, // it nodded off because you left; it wakes when you're back
     rng: Rng,
 }
 
@@ -125,6 +126,7 @@ impl Game {
             news: String::new(),
             retiring: false,
             evo_flash: 0,
+            dozed_while_away: false,
             rng: Rng(seed | 1),
         };
         g.greet(); // it may have waited for you while the app was closed
@@ -176,14 +178,14 @@ impl Game {
     /// Moves the game from clock time `last` to `now`. A short gap is replayed second by second;
     /// a long one (PC asleep, clock jumped) counts as time away; a clock that went backwards is
     /// no time at all.
-    pub fn advance(&mut self, last: u64, now: u64, standing: bool) -> Vec<Event> {
+    pub fn advance(&mut self, last: u64, now: u64, standing: bool, away: bool) -> Vec<Event> {
         let gap = now.saturating_sub(last);
         if gap > CATCH_UP_LIMIT {
             self.pet.catch_up(gap);
             self.pet.review_day(now); // credit the days away first...
             self.pet.welcome_back(last, now); // ...then see whether it still needed to wait
             let before = self.news.clone();
-            let ev = self.second(now, standing);
+            let ev = self.second(now, standing, away);
             let happened = if self.news != before { std::mem::take(&mut self.news) } else { String::new() };
             self.greet();
             // Keep anything else that happened on return (e.g. it evolved) alongside the greeting.
@@ -192,12 +194,13 @@ impl Game {
             }
             return ev;
         }
-        (1..=gap).flat_map(|s| self.second(last + s, standing)).collect()
+        (1..=gap).flat_map(|s| self.second(last + s, standing, away)).collect()
     }
 
     /// Once per second of clock time. `standing` says it's on the ground and not being held,
-    /// which evolving, retiring and pooping wait for.
-    pub fn second(&mut self, now: u64, standing: bool) -> Vec<Event> {
+    /// which evolving, retiring and pooping wait for. `away` says nobody's at the computer: it
+    /// dozes off, its needs drift gently, and it saves its poop for when you're back.
+    pub fn second(&mut self, now: u64, standing: bool, away: bool) -> Vec<Event> {
         let mut ev = Vec::new();
         if let Some(next) = self.due_evolution(now, standing) {
             self.evolve(next, now, &mut ev);
@@ -207,13 +210,23 @@ impl Game {
             self.retiring = true;
             ev.push(Event::Retire);
         }
-        match self.pet.live_second(now, !(self.battle.is_some() || self.training())) {
+        let busy = self.battle.is_some() || self.training();
+        if away && !busy && !self.pet.asleep && self.pet.stage() != Stage::Egg {
+            self.pet.sleep_at(now);
+            self.dozed_while_away = true;
+            self.set_act(Act::Idle, 20);
+        } else if !away && std::mem::take(&mut self.dozed_while_away) && self.pet.asleep {
+            self.pet.asleep = false; // you're back
+            self.set_act(Act::Joy, 15);
+        }
+        match self.pet.live_second(now, !busy, away) {
             Sleep::Woke => self.set_act(Act::Joy, 15),
             // Reactions don't tick while asleep, so drop any pending one or it sticks.
             Sleep::FellAsleep => self.set_act(Act::Idle, 20),
             Sleep::Unchanged => {}
         }
-        if self.pet.next_poop != 0 && now >= self.pet.next_poop && standing && self.battle.is_none() {
+        let poop_due = self.pet.next_poop != 0 && now >= self.pet.next_poop;
+        if poop_due && standing && !away && self.battle.is_none() {
             self.pet.next_poop = 0;
             if self.pet.poops.len() >= MAX_POOPS {
                 // Nowhere left to go: that's on you.
@@ -221,7 +234,8 @@ impl Game {
                 self.pet.happy = (self.pet.happy - 10.0).max(0.0);
             } else {
                 ev.push(Event::Poop);
-                if !self.pet.asleep && !self.training() {
+                let reacting = matches!(self.act, Act::Joy | Act::Show(_) | Act::Eat);
+                if !self.pet.asleep && !self.training() && !reacting {
                     self.set_act(Act::Walk, 30); // wander away from it
                 }
             }
@@ -663,7 +677,7 @@ mod tests {
     fn run(g: &mut Game, secs: u64, mut done: impl FnMut(&Game) -> bool) -> (u64, Vec<Event>) {
         let mut seen = Vec::new();
         for s in 0..secs {
-            seen.extend(g.second(NOW + s, true));
+            seen.extend(g.second(NOW + s, true, false));
             for _ in 0..10 {
                 if g.battle.is_some() {
                     seen.extend(g.battle_tick(true));
@@ -792,19 +806,19 @@ mod tests {
         let mut g = game(Species::Blop);
         g.pet.stage_since = NOW - 10 * 3600;
         g.command(CMD_BATTLE, NOW);
-        g.second(NOW, true);
+        g.second(NOW, true, false);
         assert_eq!(g.pet.species, Species::Blop, "mustn't evolve mid-battle");
         g.battle = None;
         g.act = Act::Idle;
-        g.second(NOW, false);
+        g.second(NOW, false, false);
         assert_eq!(g.pet.species, Species::Blop, "mustn't evolve mid-air");
-        g.second(NOW, true);
+        g.second(NOW, true, false);
         assert_ne!(g.pet.species, Species::Blop);
 
         let mut old = game(Species::Raptin);
         old.pet.born = NOW - 60 * 86_400;
-        assert!(!old.second(NOW, false).contains(&Event::Retire), "not mid-air");
-        assert!(old.second(NOW, true).contains(&Event::Retire));
+        assert!(!old.second(NOW, false, false).contains(&Event::Retire), "not mid-air");
+        assert!(old.second(NOW, true, false).contains(&Event::Retire));
     }
 
     #[test]
@@ -812,7 +826,7 @@ mod tests {
         let mut g = game(Species::Blop);
         g.pet.stage_since = NOW - 10 * 3600; // long overdue
         g.command(CMD_TRAIN + 1, NOW);
-        g.second(NOW, true);
+        g.second(NOW, true, false);
         assert_eq!(g.pet.species, Species::Blop, "mustn't evolve mid-drill");
         run(&mut g, 10, |g| g.pet.species != Species::Blop);
         assert_ne!(g.pet.species, Species::Blop, "evolves once the drill is done");
@@ -823,17 +837,17 @@ mod tests {
         let mut g = game(Species::Raptin);
         g.pet.born = NOW - 60 * 86_400;
         g.command(CMD_BATTLE, NOW);
-        assert!(!g.second(NOW, true).contains(&Event::Retire), "not mid-battle");
+        assert!(!g.second(NOW, true, false).contains(&Event::Retire), "not mid-battle");
         g.battle = None;
         g.act = Act::Idle;
-        assert!(g.second(NOW, true).contains(&Event::Retire));
-        assert!(!g.second(NOW + 1, true).contains(&Event::Retire), "only announced once");
+        assert!(g.second(NOW, true, false).contains(&Event::Retire));
+        assert!(!g.second(NOW + 1, true, false).contains(&Event::Retire), "only announced once");
         let old_gen = g.pet.generation;
         g.retire(true, NOW);
         assert_eq!(g.pet.generation, old_gen + 1);
         assert!(!g.retiring);
         assert_eq!(g.pet.born, NOW, "the successor is born at the game's time");
-        let ev: Vec<Event> = (1..300).flat_map(|s| g.second(NOW + s, true)).collect();
+        let ev: Vec<Event> = (1..300).flat_map(|s| g.second(NOW + s, true, false)).collect();
         assert!(!ev.contains(&Event::Retire), "a brand-new egg must not retire");
     }
 
@@ -855,18 +869,18 @@ mod tests {
         let energy = |g: &Game| g.pet.energy;
 
         let e = energy(&g);
-        assert!(g.advance(NOW, NOW, true).is_empty(), "no time, nothing happens");
-        assert!(g.advance(NOW, NOW - 50, true).is_empty(), "clock went backwards: nothing happens");
+        assert!(g.advance(NOW, NOW, true, false).is_empty(), "no time, nothing happens");
+        assert!(g.advance(NOW, NOW - 50, true, false).is_empty(), "clock went backwards: nothing happens");
         assert_eq!(energy(&g), e);
 
-        g.advance(NOW, NOW + 1, true);
+        g.advance(NOW, NOW + 1, true, false);
         assert!((e - energy(&g) - TIRE_RATE).abs() < 1e-4, "one second replayed");
 
         let e = energy(&g);
-        g.advance(NOW + 1, NOW + 121, true);
+        g.advance(NOW + 1, NOW + 121, true, false);
         assert!((e - energy(&g) - 120.0 * TIRE_RATE).abs() < 1e-3, "120 s replayed second by second");
 
-        g.advance(NOW + 121, NOW + 121 + 1801, true);
+        g.advance(NOW + 121, NOW + 121 + 1801, true, false);
         assert!(energy(&g) > 99.0, "a long gap counts as a full rest");
     }
 
@@ -893,7 +907,7 @@ mod tests {
         let mut g = game(Species::Raptin);
         g.pet.energy = 50.0;
         g.pet.full = 80.0;
-        g.advance(NOW, NOW + 600, true); // 10 minutes: caught up, not replayed
+        g.advance(NOW, NOW + 600, true, false); // 10 minutes: caught up, not replayed
         assert!(g.pet.energy < 50.0, "10 minutes away isn't a night's sleep");
         assert!((80.0 - g.pet.full - 600.0 * FULL_RATE * 0.5).abs() < 0.05, "half-speed hunger: {}", g.pet.full);
     }
@@ -903,13 +917,59 @@ mod tests {
         let mut g = game(Species::Raptin);
         g.pet.born = NOW - 10 * 86_400;
         let back = NOW + 40 * 86_400;
-        let ev = g.advance(NOW, back, true);
+        let ev = g.advance(NOW, back, true, false);
         assert!(!ev.contains(&Event::Retire), "it waits for you");
         assert_eq!(g.pet.life_left_at(back), GRACE);
         assert!(g.news.contains("waited for you"), "{}", g.news);
         assert!(g.news.contains("evolved"), "and the evolution on return isn't lost: {}", g.news);
-        let ev = g.advance(back, back + 30 * 86_400, true);
+        let ev = g.advance(back, back + 30 * 86_400, true, false);
         assert!(ev.contains(&Event::Retire), "but only once");
+    }
+
+    #[test]
+    fn a_night_away_from_the_computer_does_no_harm() {
+        let mut g = game(Species::Raptin);
+        g.pet.full = 80.0;
+        g.pet.happy = 80.0;
+        g.pet.energy = 60.0;
+        g.pet.next_poop = NOW + 3600;
+        let night = 8 * 3600;
+        let ev = g.advance(NOW, NOW + 1, true, true);
+        assert!(g.pet.asleep, "dozes off when you leave");
+        let mut seen = ev;
+        for s in 1..night {
+            seen.extend(g.second(NOW + 1 + s, true, true));
+            assert!(g.pet.asleep, "stays asleep all night ({s} s in), even once rested");
+        }
+        assert_eq!(g.pet.mistakes, 0, "no care mistakes overnight");
+        assert!(g.pet.full >= AWAY_FLOOR && g.pet.happy >= AWAY_FLOOR, "full {} happy {}", g.pet.full, g.pet.happy);
+        assert!(g.pet.asleep, "still asleep in the morning, even fully rested");
+        assert!(!seen.contains(&Event::Poop), "holds it until you're back");
+
+        let ev = g.second(NOW + night + 1, true, false);
+        assert!(!g.pet.asleep && g.act == Act::Joy, "wakes up happy to see you");
+        assert!(ev.contains(&Event::Poop), "...and then goes");
+    }
+
+    #[test]
+    fn back_from_a_short_break_it_wakes_up() {
+        let mut g = game(Species::Raptin);
+        g.pet.energy = 30.0;
+        for s in 0..20 * 60 {
+            g.second(NOW + s, true, true);
+        }
+        assert!(g.pet.asleep && g.pet.energy < 100.0, "a 20-minute break isn't enough to be rested");
+        g.second(NOW + 20 * 60, true, false);
+        assert!(!g.pet.asleep, "you're back, so it's up even though it's not fully rested");
+        assert_eq!(g.act, Act::Joy);
+    }
+
+    #[test]
+    fn leaving_mid_battle_doesnt_doze_it_off() {
+        let mut g = game(Species::Raptin);
+        g.command(CMD_BATTLE, NOW);
+        g.second(NOW + 1, true, true);
+        assert!(!g.pet.asleep && g.battle.is_some());
     }
 
     #[test]
@@ -917,7 +977,7 @@ mod tests {
         let mut g = game(Species::Raptin);
         g.pet.energy = 100.0;
         g.command(CMD_SLEEP, NOW);
-        g.second(NOW + 1, true);
+        g.second(NOW + 1, true, false);
         assert!(g.pet.asleep, "lights out must actually put it to bed");
         g.command(CMD_SLEEP, NOW + 2);
         assert!(!g.pet.asleep, "and Wake up wakes it");
@@ -959,7 +1019,7 @@ mod tests {
         let mut g = game(Species::Raptin);
         g.pet.poops = vec![(0, 0); MAX_POOPS];
         g.pet.next_poop = NOW;
-        let ev = g.second(NOW, true);
+        let ev = g.second(NOW, true, false);
         assert!(!ev.contains(&Event::Poop));
         assert_eq!(g.pet.mistakes, 1);
     }

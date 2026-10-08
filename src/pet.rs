@@ -12,6 +12,8 @@ pub const TIRE_RATE: f32 = 100.0 / 10800.0; // tired after 3 h awake
 pub const REST_RATE: f32 = 100.0 / 1800.0; // rested after 30 min of sleep
 pub const DOZE_BELOW: f32 = 10.0; // falls asleep on its own under this much energy
 pub const MIN_NAP: u64 = 600; // once asleep it sleeps at least this long, even with full energy
+/// While you're away (app closed or just not at the computer) needs never drift below this.
+pub const AWAY_FLOOR: f32 = 15.0;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Sleep {
@@ -156,22 +158,29 @@ impl Pet {
 
     /// One second of life: hunger, happiness and energy drift, sleep, and care mistakes.
     /// `may_doze` is false while it's busy (battling, training) so it finishes before nodding off.
-    pub fn live_second(&mut self, now: u64, may_doze: bool) -> Sleep {
+    /// `away` means you're not at the computer (screensaver, locked, idle): needs drift gently,
+    /// never below 15, the same as when the app is closed, and it doesn't wake up on its own.
+    pub fn live_second(&mut self, now: u64, may_doze: bool, away: bool) -> Sleep {
         if self.stage() == Stage::Egg {
             return Sleep::Unchanged;
         }
-        let slow = if self.asleep { 0.5 } else { 1.0 };
-        self.full = (self.full - FULL_RATE * slow).max(0.0);
-        let mut sad = HAPPY_RATE * (1.0 + self.poops.len() as f32);
-        if self.full < 20.0 {
-            sad *= 2.0;
+        if away {
+            self.full = (self.full - FULL_RATE * 0.5).max(self.full.min(AWAY_FLOOR));
+            self.happy = (self.happy - HAPPY_RATE * 0.5).max(self.happy.min(AWAY_FLOOR));
+        } else {
+            let slow = if self.asleep { 0.5 } else { 1.0 };
+            self.full = (self.full - FULL_RATE * slow).max(0.0);
+            let mut sad = HAPPY_RATE * (1.0 + self.poops.len() as f32);
+            if self.full < 20.0 {
+                sad *= 2.0;
+            }
+            self.happy = (self.happy - sad * slow).max(0.0);
         }
-        self.happy = (self.happy - sad * slow).max(0.0);
 
         let mut change = Sleep::Unchanged;
         if self.asleep {
             self.energy = (self.energy + REST_RATE).min(100.0);
-            if self.energy >= 100.0 && now >= self.asleep_since.saturating_add(MIN_NAP) {
+            if self.energy >= 100.0 && now >= self.asleep_since.saturating_add(MIN_NAP) && !away {
                 self.asleep = false;
                 change = Sleep::Woke;
             }
@@ -228,8 +237,8 @@ impl Pet {
             return;
         }
         let away = secs as f32;
-        self.full = (self.full - away * FULL_RATE * 0.5).max(self.full.min(15.0));
-        self.happy = (self.happy - away * HAPPY_RATE * 0.5).max(self.happy.min(15.0));
+        self.full = (self.full - away * FULL_RATE * 0.5).max(self.full.min(AWAY_FLOOR));
+        self.happy = (self.happy - away * HAPPY_RATE * 0.5).max(self.happy.min(AWAY_FLOOR));
         if secs > 1800 {
             self.energy = 100.0;
             self.asleep = false;
@@ -660,12 +669,12 @@ mod tests {
         let mut p = sample();
         p.asleep = false;
         p.energy = DOZE_BELOW - 1.0;
-        assert_eq!(p.live_second(NOW, false), Sleep::Unchanged);
+        assert_eq!(p.live_second(NOW, false, false), Sleep::Unchanged);
         assert!(!p.asleep);
-        assert_eq!(p.live_second(NOW, true), Sleep::FellAsleep);
+        assert_eq!(p.live_second(NOW, true, false), Sleep::FellAsleep);
         assert!(p.asleep);
         p.energy = 99.99;
-        assert_eq!(p.live_second(NOW + MIN_NAP, true), Sleep::Woke);
+        assert_eq!(p.live_second(NOW + MIN_NAP, true, false), Sleep::Woke);
         assert_eq!(p.energy, 100.0);
     }
 
@@ -677,11 +686,11 @@ mod tests {
         p.starving = false;
         let before = p.mistakes;
         for _ in 0..100 {
-            p.live_second(NOW, true);
+            p.live_second(NOW, true, false);
         }
         assert_eq!(p.mistakes, before + 1);
         p.full = 50.0;
-        p.live_second(NOW, true);
+        p.live_second(NOW, true, false);
         assert!(!p.starving);
     }
 
@@ -812,9 +821,9 @@ saved={NOW}
         p.asleep = false;
         p.energy = 100.0;
         p.sleep_at(NOW);
-        assert_eq!(p.live_second(NOW + 1, true), Sleep::Unchanged, "mustn't pop awake at once");
+        assert_eq!(p.live_second(NOW + 1, true, false), Sleep::Unchanged, "mustn't pop awake at once");
         assert!(p.asleep);
-        assert_eq!(p.live_second(NOW + MIN_NAP, true), Sleep::Woke);
+        assert_eq!(p.live_second(NOW + MIN_NAP, true, false), Sleep::Woke);
     }
 
     #[test]
@@ -874,7 +883,7 @@ saved={NOW}
         p.sleep_at(NOW);
         let (mut q, _) = Pet::parse(&p.serialize(0.0, NOW), NOW + 1).unwrap();
         assert!(q.asleep);
-        assert_eq!(q.live_second(NOW + 2, true), Sleep::Unchanged, "mustn't wake the moment it's loaded");
+        assert_eq!(q.live_second(NOW + 2, true, false), Sleep::Unchanged, "mustn't wake the moment it's loaded");
     }
 
     /// A fresh, empty folder for one test.
@@ -975,7 +984,7 @@ saved={NOW}
         p.sulking = false;
         let before = p.mistakes;
         for _ in 0..100 {
-            p.live_second(NOW, true);
+            p.live_second(NOW, true, false);
         }
         assert_eq!(p.mistakes, before + 1);
     }
@@ -996,7 +1005,7 @@ saved={NOW}
         let close = |a: f32, b: f32| (a - b).abs() < 1e-4;
         let drop = |p: &mut Pet| {
             let (f, h, e) = (p.full, p.happy, p.energy);
-            p.live_second(NOW, false);
+            p.live_second(NOW, false, false);
             (f - p.full, h - p.happy, e - p.energy)
         };
 
