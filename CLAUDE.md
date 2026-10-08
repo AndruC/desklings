@@ -29,3 +29,7 @@ A memory-light Windows desktop pet (Digimon / Monster Rancher–style) in Rust u
 ## Testing in the real app
 
 GUI changes need a look at the actual window. A screen capture must use `BitBlt` with `CAPTUREBLT` (0x40CC0020) or layered windows won't show. To test a scenario, back up `%APPDATA%\desklings\state.txt`, edit it (e.g. `species=`, `stats=`, `born=`, `stage_since=`), launch, post `WM_COMMAND` IDs (Battle = 7, Train = 20–24) to the `DesklingsBuddy` window, capture, then restore the backup. Find windows with `EnumWindows` + class name. From PowerShell, `FindWindowW(cls, $null)` passes `""` and fails.
+
+## Releasing
+
+Bump `version` in `Cargo.toml`, commit, then `git tag vX.Y.Z && git push origin main vX.Y.Z`. `.github/workflows/release.yml` tests, builds and publishes `desklings.exe` to a GitHub Release for that tag. The `gh` CLI lives at `C:\Program Files\GitHub CLI\gh.exe` if it isn't on PATH.

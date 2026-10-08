@@ -6,6 +6,12 @@ It's a single ~200 KB native executable written in Rust against raw Win32 APIs. 
 
 ![The monsters](docs/sprites.png)
 
+## Download
+
+Grab `desklings.exe` from the [latest release](https://github.com/AndruC/desklings/releases/latest) and run it. There's no installer. To have it start with Windows, put a shortcut in `shell:startup`.
+
+The exe isn't code-signed, so Windows SmartScreen may warn you the first time. Click **More info → Run anyway**.
+
 ## Features
 
 - **Lives on your taskbar.** Always on top. Clicks pass through the transparent parts, and it never takes focus from your work. Drag it anywhere, even to another monitor, and it drops back down. Pixel art stays crisp at any DPI.

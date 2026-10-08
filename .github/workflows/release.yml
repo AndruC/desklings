@@ -1,0 +1,33 @@
+# Builds desklings.exe on Windows and publishes a GitHub Release whenever a tag like v1.2.3 is pushed.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write # needed to create the release
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Test
+        run: cargo test --release
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Publish release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" target/release/desklings.exe \
+            --title "Desklings $GITHUB_REF_NAME" \
+            --generate-notes \
+            --notes "Download **desklings.exe** below and run it. No installer needed; it saves to \`%APPDATA%\desklings\`.
+
+          Windows may show a SmartScreen warning because the exe isn't code-signed: click **More info → Run anyway**."
