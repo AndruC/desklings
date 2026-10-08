@@ -19,6 +19,9 @@ pub const CMD_RETIRE: i32 = 10;
 pub const CMD_TRAIN: i32 = 20; // + drill index
 pub const CMD_LAST: i32 = CMD_TRAIN + Drill::ALL.len() as i32 - 1;
 
+/// Gaps longer than this (PC asleep, clock jump) are handled as time away instead of replayed.
+pub const CATCH_UP_LIMIT: u64 = 120;
+
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Act {
     Idle,
@@ -58,6 +61,45 @@ pub struct Battle {
     end_t: u32,
     pub lunge: (u32, u32), // ticks left for (me, foe)
     pub flash: (u32, u32),
+}
+
+impl Battle {
+    pub fn new(me: Fighter, foe: Fighter) -> Battle {
+        Battle {
+            my_turn: strikes_first(&me, &foe),
+            me,
+            foe,
+            step_t: 6,
+            turns: 0,
+            result: None,
+            end_t: 0,
+            lunge: (0, 0),
+            flash: (0, 0),
+        }
+    }
+
+    /// One blow: whoever's turn it is attacks, then the turn passes; the result is decided once
+    /// someone drops or the turns run out.
+    pub fn exchange(&mut self, rng: &mut Rng) -> Hit {
+        self.turns += 1;
+        let hit = if self.my_turn {
+            self.lunge.0 = 3;
+            strike(&self.me, &mut self.foe, rng)
+        } else {
+            self.lunge.1 = 3;
+            strike(&self.foe, &mut self.me, rng)
+        };
+        if let Hit::Hit(_) | Hit::Crit(_) = hit {
+            let flash = if self.my_turn { &mut self.flash.1 } else { &mut self.flash.0 };
+            *flash = if matches!(hit, Hit::Crit(_)) { 6 } else { 3 };
+        }
+        self.my_turn = !self.my_turn;
+        if let Some(won) = outcome(&self.me, &self.foe, self.turns) {
+            self.result = Some(won);
+            self.end_t = 25;
+        }
+        hit
+    }
 }
 
 pub struct Game {
@@ -122,6 +164,18 @@ impl Game {
 
     // ------------------------------------------------------------------ time
 
+    /// Moves the game from clock time `last` to `now`. A short gap is replayed second by second;
+    /// a long one (PC asleep, clock jumped) counts as time away; a clock that went backwards is
+    /// no time at all.
+    pub fn advance(&mut self, last: u64, now: u64, standing: bool) -> Vec<Event> {
+        let gap = now.saturating_sub(last);
+        if gap > CATCH_UP_LIMIT {
+            self.pet.catch_up(gap);
+            return self.second(now, standing);
+        }
+        (1..=gap).flat_map(|s| self.second(last + s, standing)).collect()
+    }
+
     /// Once per second of clock time. `standing` says it's on the ground and not being held,
     /// which evolving, retiring and pooping wait for.
     pub fn second(&mut self, now: u64, standing: bool) -> Vec<Event> {
@@ -159,7 +213,7 @@ impl Game {
     fn due_evolution(&self, now: u64, standing: bool) -> Option<Species> {
         let dur = self.pet.stage().duration()?;
         let busy = self.battle.is_some() || self.training() || !standing;
-        if now < self.pet.stage_since + dur || self.pet.life_left_at(now) == 0 || busy {
+        if now < self.pet.stage_since.saturating_add(dur) || self.pet.life_left_at(now) == 0 || busy {
             return None;
         }
         evolution(self.pet.species, &self.pet.stats, self.pet.mistakes, self.pet.wins)
@@ -258,13 +312,17 @@ impl Game {
                 self.set_act(Act::Joy, 10);
             }
             CMD_SLEEP => {
-                self.pet.asleep = !self.pet.asleep;
+                if self.pet.asleep {
+                    self.pet.asleep = false;
+                } else {
+                    self.pet.sleep_at(now);
+                }
                 self.set_act(Act::Idle, 20);
             }
             CMD_RESET => {
                 self.pet.poops.clear();
                 ev.push(Event::PoopsCleared);
-                self.pet = Pet::new(self.pet.seen);
+                self.pet = Pet::new_at(self.pet.seen, now);
                 self.news.clear();
                 self.set_act(Act::Idle, 20);
             }
@@ -351,17 +409,7 @@ impl Game {
         self.pet.full = (self.pet.full - 8.0).max(0.0);
         let foe = opponent(self.pet.rank as usize, &mut self.rng);
         let me = Fighter::new(self.pet.species, self.pet.stats);
-        self.battle = Some(Battle {
-            my_turn: strikes_first(&me, &foe),
-            me,
-            foe,
-            step_t: 6,
-            turns: 0,
-            result: None,
-            end_t: 0,
-            lunge: (0, 0),
-            flash: (0, 0),
-        });
+        self.battle = Some(Battle::new(me, foe));
         self.set_act(Act::Battle, 0);
         ev.push(Event::BattleStarted);
     }
@@ -387,23 +435,7 @@ impl Game {
             return ev;
         }
         b.step_t = 8;
-        b.turns += 1;
-        let hit = if b.my_turn {
-            b.lunge.0 = 3;
-            strike(&b.me, &mut b.foe, &mut self.rng)
-        } else {
-            b.lunge.1 = 3;
-            strike(&b.foe, &mut b.me, &mut self.rng)
-        };
-        if let Hit::Hit(_) | Hit::Crit(_) = hit {
-            let flash = if b.my_turn { &mut b.flash.1 } else { &mut b.flash.0 };
-            *flash = if matches!(hit, Hit::Crit(_)) { 6 } else { 3 };
-        }
-        b.my_turn = !b.my_turn;
-        if let Some(won) = outcome(&b.me, &b.foe, b.turns) {
-            b.result = Some(won);
-            b.end_t = 25;
-        }
+        b.exchange(&mut self.rng);
         ev
     }
 
@@ -459,14 +491,14 @@ impl Game {
 
     /// Replaces the pet with its successor. The shell has already written the Hall of Fame entry
     /// (`enshrined` says whether that worked).
-    pub fn retire(&mut self, enshrined: bool) -> Vec<Event> {
+    pub fn retire(&mut self, enshrined: bool, now: u64) -> Vec<Event> {
         let mut ev = vec![Event::PoopsCleared];
         if self.battle.take().is_some() {
             ev.push(Event::BattleOver);
         }
         self.pet.poops.clear();
         let name = self.pet.species.info().name;
-        self.pet = self.pet.successor();
+        self.pet = self.pet.successor_at(now);
         self.news = format!("{name} retired. Generation {} begins!", self.pet.generation);
         if !enshrined {
             self.news += " (Couldn't write the Hall of Fame file.)";
@@ -531,7 +563,9 @@ impl Game {
         let next = match p.stage().duration() {
             None => "Fully evolved.".to_string(),
             Some(_) if !can_evolve(p.species) => "This is its final form.".into(),
-            Some(d) if now < p.stage_since + d => format!("Next evolution in {}.", duration(p.stage_since + d - now)),
+            Some(d) if now < p.stage_since.saturating_add(d) => {
+                format!("Next evolution in {}.", duration(p.stage_since.saturating_add(d) - now))
+            }
             Some(_) if evolution(p.species, &p.stats, p.mistakes, p.wins).is_none() => {
                 "Old enough to evolve — still missing a requirement.".into()
             }
@@ -595,7 +629,7 @@ mod tests {
     const NOW: u64 = 1_800_000_000;
 
     fn game(species: Species) -> Game {
-        let mut p = Pet::new(0);
+        let mut p = Pet::new_at(0, NOW);
         p.born = NOW - 2 * 86_400;
         p.stage_since = NOW;
         p.species = species;
@@ -671,7 +705,8 @@ mod tests {
         let (_, ev) = run(&mut g, 30, |g| g.pet.asleep);
         assert!(g.pet.asleep, "should doze off afterwards");
         assert!(ev.contains(&Event::Save), "the session was finished and saved");
-        assert!(total(&g.pet.stats) > before || g.news.contains("slacked"), "news: {}", g.news);
+        assert!(total(&g.pet.stats) > before, "news: {}", g.news);
+        assert!(g.news.starts_with("Run:") && g.news.contains('+'), "news: {}", g.news);
         assert_eq!(g.act, Act::Idle, "no reaction left stuck while asleep");
     }
 
@@ -711,7 +746,8 @@ mod tests {
         let before = total(&drill.pet.stats);
         drill.settle(NOW);
         assert!(!matches!(drill.act, Act::Train(_)));
-        assert!(total(&drill.pet.stats) > before || drill.news.contains("slacked"));
+        assert!(total(&drill.pet.stats) > before, "news: {}", drill.news);
+        assert!(drill.news.starts_with("Run:") && drill.news.contains('+'), "news: {}", drill.news);
     }
 
     #[test]
@@ -754,9 +790,12 @@ mod tests {
         assert!(g.second(NOW, true).contains(&Event::Retire));
         assert!(!g.second(NOW + 1, true).contains(&Event::Retire), "only announced once");
         let old_gen = g.pet.generation;
-        g.retire(true);
+        g.retire(true, NOW);
         assert_eq!(g.pet.generation, old_gen + 1);
         assert!(!g.retiring);
+        assert_eq!(g.pet.born, NOW, "the successor is born at the game's time");
+        let ev: Vec<Event> = (1..300).flat_map(|s| g.second(NOW + s, true)).collect();
+        assert!(!ev.contains(&Event::Retire), "a brand-new egg must not retire");
     }
 
     #[test]
@@ -768,6 +807,70 @@ mod tests {
         assert_eq!(g.pet.poops, vec![(1, 1)]);
         assert_eq!(g.pet.happy, 52.0);
         assert!(!g.clean_one(5), "no such poop");
+    }
+
+    #[test]
+    fn time_gaps_are_replayed_or_caught_up() {
+        let mut g = game(Species::Raptin);
+        g.pet.energy = 50.0;
+        let energy = |g: &Game| g.pet.energy;
+
+        let e = energy(&g);
+        assert!(g.advance(NOW, NOW, true).is_empty(), "no time, nothing happens");
+        assert!(g.advance(NOW, NOW - 50, true).is_empty(), "clock went backwards: nothing happens");
+        assert_eq!(energy(&g), e);
+
+        g.advance(NOW, NOW + 1, true);
+        assert!((e - energy(&g) - TIRE_RATE).abs() < 1e-4, "one second replayed");
+
+        let e = energy(&g);
+        g.advance(NOW + 1, NOW + 121, true);
+        assert!((e - energy(&g) - 120.0 * TIRE_RATE).abs() < 1e-3, "120 s replayed second by second");
+
+        g.advance(NOW + 121, NOW + 121 + 1801, true);
+        assert!(energy(&g) > 99.0, "a long gap counts as a full rest");
+    }
+
+    #[test]
+    fn lights_out_works_even_when_rested() {
+        let mut g = game(Species::Raptin);
+        g.pet.energy = 100.0;
+        g.command(CMD_SLEEP, NOW);
+        g.second(NOW + 1, true);
+        assert!(g.pet.asleep, "lights out must actually put it to bed");
+        g.command(CMD_SLEEP, NOW + 2);
+        assert!(!g.pet.asleep, "and Wake up wakes it");
+    }
+
+    /// Fights two monsters with the game's own battle code; true if `a` wins.
+    fn duel(a: Fighter, b: Fighter, rng: &mut Rng) -> bool {
+        let mut battle = Battle::new(a, b);
+        loop {
+            battle.exchange(rng);
+            if let Some(won) = battle.result {
+                return won;
+            }
+        }
+    }
+
+    #[test]
+    fn stronger_monster_usually_wins() {
+        let mut rng = Rng(99);
+        let wins = (0..500)
+            .filter(|_| duel(Fighter::new(Species::Pyrorex, [60, 90, 60, 60, 40]), opponent(1, &mut rng), &mut rng))
+            .count();
+        assert!(wins > 450, "won {wins}/500");
+
+        // Identical monsters: the rules are symmetric, and striking first is an edge, not a lock.
+        let twin = || Fighter::new(Species::Raptin, [30; 5]);
+        let first_wins = (0..2000).filter(|_| duel(twin(), twin(), &mut rng)).count();
+        assert!((1000..=1400).contains(&first_wins), "first striker won {first_wins}/2000");
+        // One point less Speed makes `a` strike second; it should then win about as often as
+        // the first striker loses.
+        let slower = || Fighter::new(Species::Raptin, [30, 30, 30, 29, 30]);
+        let second_wins = (0..2000).filter(|_| duel(slower(), twin(), &mut rng)).count();
+        let sum = first_wins + second_wins;
+        assert!((1800..=2200).contains(&sum), "first {first_wins} + second {second_wins} should be ~2000");
     }
 
     #[test]

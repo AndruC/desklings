@@ -11,6 +11,7 @@ pub const HAPPY_RATE: f32 = 100.0 / 7200.0; // empty in 2 h (faster with poop / 
 pub const TIRE_RATE: f32 = 100.0 / 10800.0; // tired after 3 h awake
 pub const REST_RATE: f32 = 100.0 / 1800.0; // rested after 30 min of sleep
 pub const DOZE_BELOW: f32 = 10.0; // falls asleep on its own under this much energy
+pub const MIN_NAP: u64 = 600; // once asleep it sleeps at least this long, even with full energy
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Sleep {
@@ -42,6 +43,7 @@ pub struct Pet {
     pub life_mod: i64,      // seconds added to (or taken from) the base lifespan by how it's been raised
     pub care_day: u64,      // last day of age that was checked for a mistake-free bonus
     pub mistakes_mark: u32, // mistakes count at the start of that day
+    pub asleep_since: u64,  // when it last went to sleep (not saved: a reload starts the nap afresh)
 }
 
 const DAY: u64 = 86_400;
@@ -52,8 +54,8 @@ pub const OVERWORK_COST: i64 = 3 * 3600;
 const GOOD_DAY_BONUS: i64 = 12 * 3600;
 
 impl Pet {
-    pub fn new(seen: u32) -> Pet {
-        let t = now();
+    /// A new egg laid at time `t`.
+    pub fn new_at(seen: u32, t: u64) -> Pet {
         Pet {
             born: t,
             species: Species::Egg,
@@ -77,13 +79,14 @@ impl Pet {
             life_mod: 0,
             care_day: 0,
             mistakes_mark: 0,
+            asleep_since: 0,
         }
     }
 
     /// A fresh egg for the next generation, inheriting a tenth of the retiree's stats (up to +50 each).
-    pub fn successor(&self) -> Pet {
-        let mut p = Pet::new(self.seen);
-        p.generation = self.generation + 1;
+    pub fn successor_at(&self, now: u64) -> Pet {
+        let mut p = Pet::new_at(self.seen, now);
+        p.generation = self.generation.saturating_add(1);
         for (s, parent) in p.stats.iter_mut().zip(self.stats) {
             *s += (parent / 10).min(50);
         }
@@ -99,13 +102,9 @@ impl Pet {
         now.saturating_sub(self.born)
     }
 
-    pub fn age(&self) -> u64 {
-        self.age_at(now())
-    }
-
     pub fn mistake(&mut self) {
-        self.mistakes += 1;
-        self.life_mod -= MISTAKE_COST;
+        self.mistakes = self.mistakes.saturating_add(1);
+        self.life_mod = self.life_mod.saturating_sub(MISTAKE_COST);
     }
 
     /// Total lifespan in seconds: a base that good care stretches and neglect or overwork shortens.
@@ -140,6 +139,12 @@ impl Pet {
         }
     }
 
+    /// Lights out: it goes to sleep now, and naps at least MIN_NAP even if it isn't tired.
+    pub fn sleep_at(&mut self, now: u64) {
+        self.asleep = true;
+        self.asleep_since = now;
+    }
+
     /// One second of life: hunger, happiness and energy drift, sleep, and care mistakes.
     /// `may_doze` is false while it's busy (battling, training) so it finishes before nodding off.
     pub fn live_second(&mut self, now: u64, may_doze: bool) -> Sleep {
@@ -157,7 +162,7 @@ impl Pet {
         let mut change = Sleep::Unchanged;
         if self.asleep {
             self.energy = (self.energy + REST_RATE).min(100.0);
-            if self.energy >= 100.0 {
+            if self.energy >= 100.0 && now >= self.asleep_since.saturating_add(MIN_NAP) {
                 self.asleep = false;
                 change = Sleep::Woke;
             }
@@ -165,7 +170,7 @@ impl Pet {
             let tire = if self.elderly_at(now) { 1.5 } else { 1.0 };
             self.energy = (self.energy - TIRE_RATE * tire).max(0.0);
             if self.energy < DOZE_BELOW && may_doze {
-                self.asleep = true;
+                self.sleep_at(now);
                 change = Sleep::FellAsleep;
             }
         }
@@ -189,11 +194,11 @@ impl Pet {
     /// Books a battle result. Returns the new rank if this win earned a promotion.
     pub fn record_battle(&mut self, won: bool) -> Option<u8> {
         if !won {
-            self.losses += 1;
+            self.losses = self.losses.saturating_add(1);
             self.happy = (self.happy - 8.0).max(0.0);
             return None;
         }
-        self.wins += 1;
+        self.wins = self.wins.saturating_add(1);
         self.happy = (self.happy + 10.0).min(100.0);
         if self.rank as usize >= RANKS.len() - 1 {
             return None; // already at the top: nothing left to count towards
@@ -244,11 +249,12 @@ impl Pet {
     /// Adds this monster to the Hall of Fame file, once: each line ends with a hidden ` #<born>`
     /// tag so a retirement interrupted before the save is not recorded twice. Returns false if
     /// the file couldn't be written.
-    pub fn enshrine(&self) -> bool {
+    pub fn enshrine(&self, now: u64) -> bool {
         use std::io::Write;
         let Some(path) = Pet::hall_path() else { return false };
         let tag = format!(" #{}", self.born);
-        let existing = std::fs::read_to_string(&path).unwrap_or_default();
+        // If the file exists but can't be read, don't append: it might already hold this entry.
+        let Some(existing) = read_text(&path) else { return false };
         if existing.lines().any(|l| l.ends_with(&tag)) {
             return true;
         }
@@ -258,7 +264,7 @@ impl Pet {
             self.generation,
             info.name,
             info.stage.name(),
-            self.age() / DAY,
+            self.age_at(now) / DAY,
             RANKS[self.rank as usize],
             self.wins,
             self.losses,
@@ -275,7 +281,7 @@ impl Pet {
 
     /// The most recent Hall of Fame entries, newest first.
     pub fn hall_of_fame(limit: usize) -> Vec<String> {
-        let text = Pet::hall_path().and_then(|p| std::fs::read_to_string(p).ok()).unwrap_or_default();
+        let text = Pet::hall_path().and_then(|p| read_text(&p)).unwrap_or_default();
         let shown = |l: &str| l.rsplit_once(" #").map_or(l, |(entry, _)| entry).to_string();
         text.lines().rev().take(limit).map(shown).collect()
     }
@@ -345,8 +351,9 @@ impl Pet {
         if !text.ends_with('\n') {
             return Err("file ends mid-line (truncated?)".into());
         }
-        let mut p = Pet::new(0);
+        let mut p = Pet::new_at(0, now);
         let (mut born, mut species, mut seen, mut x, mut saved) = (None, None, None, None, None);
+        let mut has_lifespan = false;
         for line in text.lines() {
             let Some((k, v)) = line.split_once('=') else { continue };
             match k {
@@ -391,10 +398,19 @@ impl Pet {
                 "rank_wins" => p.rank_wins = val(k, v)?,
                 "seen" => seen = Some(val(k, v)?),
                 "generation" => p.generation = val::<u32>(k, v)?.max(1),
-                "life_mod" => p.life_mod = val(k, v)?,
+                "life_mod" => {
+                    p.life_mod = val(k, v)?;
+                    has_lifespan = true;
+                }
                 "care_day" => p.care_day = val(k, v)?,
                 "mistakes_mark" => p.mistakes_mark = val(k, v)?,
-                "x" => x = Some(val::<f32>(k, v)?).filter(|f| f.is_finite()),
+                "x" => {
+                    let f: f32 = val(k, v)?;
+                    if !f.is_finite() {
+                        return Err(format!("bad x= value {v:?}"));
+                    }
+                    x = Some(f);
+                }
                 "saved" => saved = Some(val::<u64>(k, v)?),
                 _ => {}
             }
@@ -402,6 +418,24 @@ impl Pet {
 
         let saved = saved.ok_or("no saved= line (file truncated?)")?;
         p.born = born.ok_or("no born= line")?;
+
+        // Values of the right type but absurd size (hand edits, corruption) are damage too:
+        // left in, they'd overflow timers and counters. Times may be somewhat ahead of `saved`
+        // (the clock can be set back), but not by a year.
+        let year = 365 * DAY;
+        let ranges = [
+            (p.born <= saved.saturating_add(year), "born="),
+            (p.stage_since <= saved.saturating_add(year), "stage_since="),
+            (p.next_poop <= saved.saturating_add(year), "next_poop="),
+            (p.rank_wins < WINS_TO_RANK_UP, "rank_wins="),
+            (p.generation <= 1_000_000, "generation="),
+            (p.life_mod.unsigned_abs() <= 1000 * DAY, "life_mod="),
+            (p.care_day <= 100_000, "care_day="),
+            (p.mistakes.max(p.mistakes_mark).max(p.wins).max(p.losses) <= 10_000_000, "a counter"),
+        ];
+        if let Some((_, what)) = ranges.iter().find(|(ok, _)| !ok) {
+            return Err(format!("{what} out of range"));
+        }
         p.species = match species {
             Some(s) => s,
             // Saves from before evolution paths: carry on as whatever its age implies.
@@ -419,6 +453,13 @@ impl Pet {
             let line = [Species::Egg, Species::Blip, Species::Blop];
             line.iter().filter(|s| s.info().stage <= p.stage()).fold(p.species.bit(), |m, s| m | s.bit())
         });
+        if !has_lifespan {
+            // Saved before lifespans existed: start its lifespan from today rather than charging
+            // it for its whole past (an old pet would otherwise retire the moment it loads).
+            let age = p.age_at(now);
+            p.life_mod = age as i64;
+            p.care_day = age / DAY;
+        }
         p.catch_up(now.saturating_sub(saved));
         Ok((p, x))
     }
@@ -463,9 +504,19 @@ impl Pet {
                     return Loaded::Unreadable(format!("{} is damaged ({why}) and couldn't be backed up", path.display()));
                 }
                 let note = format!("Save file was damaged ({why}); kept a copy as {}.", bad.file_name().unwrap_or_default().to_string_lossy());
-                Loaded::Damaged(Pet::new(seen), note)
+                Loaded::Damaged(Pet::new_at(seen, now()), note)
             }
         }
+    }
+}
+
+/// Reads a text file, tolerating bytes that aren't UTF-8 (e.g. re-saved as ANSI by an editor).
+/// A missing file reads as empty; any other error is None.
+fn read_text(path: &std::path::Path) -> Option<String> {
+    match std::fs::read(path) {
+        Ok(bytes) => Some(String::from_utf8_lossy(&bytes).into_owned()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(String::new()),
+        Err(_) => None,
     }
 }
 
@@ -482,10 +533,10 @@ mod tests {
 
     #[test]
     fn successor_inherits_a_tenth_capped() {
-        let mut p = Pet::new(0);
+        let mut p = Pet::new_at(0, NOW);
         p.stats = [999, 300, 45, 0, 120];
         p.generation = 3;
-        let kid = p.successor();
+        let kid = p.successor_at(NOW);
         assert_eq!(kid.stats, [60, 40, 14, 10, 22]);
         assert_eq!(kid.generation, 4);
         assert_eq!(kid.species, Species::Egg);
@@ -493,7 +544,7 @@ mod tests {
 
     #[test]
     fn care_changes_lifespan() {
-        let mut p = Pet::new(0);
+        let mut p = Pet::new_at(0, NOW);
         let base = p.lifespan();
         p.mistake();
         p.mistake();
@@ -507,7 +558,7 @@ mod tests {
     const NOW: u64 = 1_800_000_000;
 
     fn sample() -> Pet {
-        let mut p = Pet::new(0b1011);
+        let mut p = Pet::new_at(0b1011, NOW);
         p.born = NOW - 3 * DAY;
         p.species = Species::Mystifur;
         p.stage_since = NOW - DAY;
@@ -562,7 +613,7 @@ mod tests {
         assert_eq!(p.live_second(NOW, true), Sleep::FellAsleep);
         assert!(p.asleep);
         p.energy = 99.99;
-        assert_eq!(p.live_second(NOW, true), Sleep::Woke);
+        assert_eq!(p.live_second(NOW + MIN_NAP, true), Sleep::Woke);
         assert_eq!(p.energy, 100.0);
     }
 
@@ -672,6 +723,70 @@ saved={NOW}
     }
 
     #[test]
+    fn absurd_values_are_damage_not_overflow() {
+        let text = sample().serialize(0.0, NOW);
+        for (from, to) in [
+            (format!("stage_since={}", NOW - DAY), "stage_since=18446744073709551605".to_string()),
+            (format!("born={}", NOW - 3 * DAY), "born=18446744073709551605".to_string()),
+            ("rank_wins=2".to_string(), "rank_wins=255".to_string()),
+            ("generation=4".to_string(), "generation=4294967295".to_string()),
+            ("life_mod=-3600".to_string(), "life_mod=-9223372036854775807".to_string()),
+            ("wins=7".to_string(), "wins=4294967295".to_string()),
+            ("x=0".to_string(), "x=NaN".to_string()),
+        ] {
+            assert!(text.contains(&from), "fixture lacks {from}");
+            assert!(Pet::parse(&text.replace(&from, &to), NOW).is_err(), "{to} should be rejected");
+        }
+        // A clock set back a few days is still fine (see clock_set_back_is_not_damage...).
+        let behind = text.replace(&format!("saved={NOW}"), &format!("saved={}", NOW - 5 * DAY));
+        assert!(Pet::parse(&behind, NOW).is_ok());
+    }
+
+    #[test]
+    fn very_old_saves_get_a_fresh_lifespan() {
+        let born = NOW - 30 * DAY; // the first save format had no lifespan at all
+        let text = format!("born={born}\nfull=50\nhappy=60\nenergy=70\npoops=\nasleep=0\nnext_poop=0\nx=5\nsaved={NOW}\n");
+        let (p, _) = Pet::parse(&text, NOW).unwrap();
+        assert!(p.life_left_at(NOW) >= BASE_LIFESPAN, "a 30-day-old legacy pet must not retire on load");
+        assert_eq!(p.care_day, 30, "and doesn't get 30 days of back-pay bonuses either");
+        let mut q = p;
+        q.review_day(NOW);
+        assert_eq!(q.life_left_at(NOW), BASE_LIFESPAN);
+    }
+
+    #[test]
+    fn lights_out_at_full_energy_still_naps() {
+        let mut p = sample();
+        p.asleep = false;
+        p.energy = 100.0;
+        p.sleep_at(NOW);
+        assert_eq!(p.live_second(NOW + 1, true), Sleep::Unchanged, "mustn't pop awake at once");
+        assert!(p.asleep);
+        assert_eq!(p.live_second(NOW + MIN_NAP, true), Sleep::Woke);
+    }
+
+    #[test]
+    fn successor_is_born_now_and_generation_never_wraps() {
+        let mut p = sample();
+        p.generation = u32::MAX;
+        let kid = p.successor_at(NOW + 7);
+        assert_eq!((kid.born, kid.stage_since, kid.generation), (NOW + 7, NOW + 7, u32::MAX));
+    }
+
+    #[test]
+    fn hall_of_fame_text_survives_an_ansi_resave() {
+        let dir = std::env::temp_dir().join(format!("desklings-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("halloffame.txt");
+        // "Gen 1 · Raptin ... #123" written back by an editor as Windows-1252: '·' is byte 0xB7.
+        std::fs::write(&file, b"Gen 1 \xB7 Raptin (Rookie) #123\n").unwrap();
+        let text = read_text(&file).expect("readable");
+        assert!(text.lines().any(|l| l.ends_with(" #123")), "dedupe tag still found: {text:?}");
+        assert_eq!(read_text(&dir.join("missing.txt")), Some(String::new()), "missing file reads as empty");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn byte_order_mark_is_ignored() {
         let text = format!("\u{FEFF}{}", sample().serialize(0.0, NOW));
         let (p, _) = Pet::parse(&text, NOW).expect("BOM must not count as damage");
@@ -744,7 +859,7 @@ saved={NOW}
 
     #[test]
     fn grumbloo_lives_shorter() {
-        let mut p = Pet::new(0);
+        let mut p = Pet::new_at(0, NOW);
         let normal = p.lifespan();
         p.species = Species::Grumbloo;
         assert_eq!(p.lifespan(), normal * 3 / 4);
@@ -766,14 +881,14 @@ saved={NOW}
 
     #[test]
     fn mistakes_spoil_good_days() {
-        let mut p = Pet::new(0);
+        let mut p = Pet::new_at(0, NOW);
         p.born = NOW - DAY - 5;
         let base = p.lifespan();
         p.mistake();
         p.review_day(NOW);
         assert_eq!(p.lifespan(), base - MISTAKE_COST as u64, "a day with a mistake earns nothing");
 
-        let mut gap = Pet::new(0);
+        let mut gap = Pet::new_at(0, NOW);
         gap.born = NOW - 4 * DAY - 5;
         let base = gap.lifespan();
         gap.mistake();
@@ -783,7 +898,7 @@ saved={NOW}
 
     #[test]
     fn mistake_free_day_adds_life() {
-        let mut p = Pet::new(0);
+        let mut p = Pet::new_at(0, NOW);
         p.born = NOW - DAY - 5;
         let base = p.lifespan();
         p.review_day(NOW);
@@ -794,7 +909,7 @@ saved={NOW}
 
     #[test]
     fn elderly_in_last_fifteen_percent() {
-        let mut p = Pet::new(0);
+        let mut p = Pet::new_at(0, NOW);
         let at = |p: &mut Pet, pct: u64| {
             p.born = NOW - p.lifespan() * pct / 100;
             p.elderly_at(NOW)

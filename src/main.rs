@@ -38,8 +38,6 @@ fn ch() -> i32 {
     LH * scale()
 }
 const TICK_MS: u32 = 100;
-/// Gaps longer than this (PC asleep, clock jump) are handled like time away instead of replayed.
-const CATCH_UP_LIMIT: u64 = 120;
 
 /// Posted to the buddy window when its lifespan runs out, so the farewell box opens outside the tick.
 const WM_RETIRE: u32 = WM_APP + 1;
@@ -221,6 +219,7 @@ struct App {
     y: f32,
     vy: f32,
     frame: u32,
+    grounded: bool, // standing on the taskbar (set on landing; cleared by jumps and grabs)
     held: Option<(i32, i32, i32, i32)>, // grab offset x/y, cursor start x/y
     dragged: bool,
     last_second: u64,
@@ -271,13 +270,14 @@ fn sprite_width(spr: Sprite) -> i32 {
 
 impl App {
     fn on_ground(&self) -> bool {
-        self.vy == 0.0 && self.held.is_none()
+        self.grounded && self.held.is_none()
     }
 
     /// Jump with a velocity given in "100% DPI" pixels per tick.
     fn hop(&mut self, v: f32) {
         if self.on_ground() {
             self.vy = -v * scale() as f32 / 4.0;
+            self.grounded = false;
         }
     }
 
@@ -325,17 +325,9 @@ impl App {
         // Timers drift and stop while the PC sleeps, so run per-second logic off the clock.
         let t = now();
         if t != self.last_second {
-            let gap = t.saturating_sub(self.last_second);
+            let ev = self.game.advance(self.last_second, t, self.on_ground());
             self.last_second = t;
-            if gap > CATCH_UP_LIMIT {
-                self.game.pet.catch_up(gap); // long pause: treat it like time away
-            }
-            // Replay short gaps second by second; a long one was just caught up in one go.
-            let reps = if gap > CATCH_UP_LIMIT { 1 } else { gap };
-            for _ in 0..reps {
-                let ev = self.game.second(t, self.on_ground());
-                self.handle(ev);
-            }
+            self.handle(ev);
             if t >= self.last_save + 60 || t < self.last_save {
                 self.last_save = t;
                 self.persist();
@@ -362,12 +354,14 @@ impl App {
             let max_x = ((wa.right - cw()) as f32).max(min_x); // keep the bubble on screen too
 
             if self.y < ground || self.vy < 0.0 {
+                self.grounded = false;
                 self.vy += 0.375 * s;
                 self.y += self.vy;
             }
             if self.y >= ground {
                 self.y = ground;
                 self.vy = 0.0;
+                self.grounded = true;
             }
 
             let g = &self.game;
@@ -410,6 +404,7 @@ impl App {
         self.game.dir = side;
         self.y = ground;
         self.vy = 0.0;
+        self.grounded = true;
         self.foe = Some(FoeView { side, x: target + side as f32 * 30.0 * s, target, y: ground });
         self.render();
         unsafe {
@@ -627,10 +622,15 @@ fn show_menu(hwnd: HWND) {
         AppendMenuW(m, MF_STRING | gray(CMD_RESET), CMD_RESET as usize, wide("Start over…").as_ptr());
         AppendMenuW(m, MF_STRING, CMD_QUIT as usize, wide("Quit").as_ptr());
         let pt = cursor();
+        // A popup menu needs its window in the foreground; hand focus back afterwards.
+        let previous = GetForegroundWindow();
         SetForegroundWindow(hwnd);
         let cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY, pt.x, pt.y, 0, hwnd, null());
         DestroyMenu(m);
         PostMessageW(hwnd, WM_NULL, 0, 0);
+        if !previous.is_null() && previous != hwnd && !matches!(cmd, CMD_GUIDE | CMD_HALL | CMD_RETIRE | CMD_RESET) {
+            SetForegroundWindow(previous);
+        }
         cmd
     };
 
@@ -639,8 +639,9 @@ fn show_menu(hwnd: HWND) {
 
 /// Retires the pet: Hall of Fame entry first (it's idempotent), then the successor arrives.
 fn retire(a: &mut App) {
-    let enshrined = a.game.pet.enshrine();
-    let ev = a.game.retire(enshrined);
+    let t = now();
+    let enshrined = a.game.pet.enshrine(t);
+    let ev = a.game.retire(enshrined, t);
     a.handle(ev);
 }
 
@@ -672,7 +673,7 @@ fn run_command(hwnd: HWND, cmd: i32, born: u64) {
         }
         CMD_RETIRE => {
             let Some(name) = with_app(|a| a.game.pet.species.info().name) else { return };
-            let ask = format!("Retire {name} to the Hall of Fame now?\n\nA new egg will inherit a tenth of its stats.");
+            let ask = format!("Retire {name} to the Hall of Fame now?\n\nA new egg will inherit a tenth of its stats (up to +50 each).");
             let ok = unsafe { MessageBoxW(hwnd, wide(&ask).as_ptr(), wide("Retire").as_ptr(), MB_YESNO | MB_ICONQUESTION) };
             if ok == IDYES {
                 with_app(|a| {
@@ -727,7 +728,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 }
                 a.held = Some((c.x - a.x as i32, c.y - a.y as i32, c.x, c.y));
                 a.dragged = false;
-                a.vy = 0.0;
                 true
             });
             if grabbed == Some(true) {
@@ -743,6 +743,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                         a.dragged = true;
                     }
                     if a.dragged {
+                        a.grounded = false; // picked up; it falls again when let go
+                        a.vy = 0.0;
                         a.x = (c.x - gx) as f32;
                         a.y = (c.y - gy) as f32;
                         a.render();
@@ -892,7 +894,7 @@ fn main() {
 
         let wa = work_area(hwnd);
         let (pet, saved_x, warning) = match Pet::load() {
-            Loaded::Fresh => (Pet::new(0), None, None),
+            Loaded::Fresh => (Pet::new_at(0, now()), None, None),
             Loaded::Ok(p, x) => (p, x, None),
             Loaded::Damaged(p, note) => (p, None, Some(note)),
             Loaded::Unreadable(why) => {
@@ -920,6 +922,7 @@ fn main() {
             y: (wa.bottom - ch() - 150) as f32, // drop in from a little above the taskbar
             vy: 0.0,
             frame: 0,
+            grounded: false,
             held: None,
             dragged: false,
             last_second: now(),

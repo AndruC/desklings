@@ -780,40 +780,6 @@ mod tests {
         assert!(fails(0.0, &mut rng) > fails(100.0, &mut rng) + 300);
     }
 
-    fn fight(a: &mut Fighter, b: &mut Fighter, rng: &mut Rng) -> bool {
-        let mut a_turn = strikes_first(a, b);
-        for turn in 1.. {
-            if a_turn { strike(a, b, rng) } else { strike(b, a, rng) };
-            if let Some(won) = outcome(a, b, turn) {
-                return won;
-            }
-            a_turn = !a_turn;
-        }
-        unreachable!()
-    }
-
-    #[test]
-    fn stronger_monster_usually_wins() {
-        let mut rng = Rng(99);
-        let wins = (0..500)
-            .filter(|_| {
-                let mut me = Fighter::new(Species::Pyrorex, [60, 90, 60, 60, 40]);
-                let mut foe = opponent(1, &mut rng);
-                fight(&mut me, &mut foe, &mut rng)
-            })
-            .count();
-        assert!(wins > 450, "won {wins}/500");
-
-        // Identical monsters: the rules are symmetric, and striking first is an edge, not a lock.
-        let twin = || Fighter::new(Species::Raptin, [30; 5]);
-        let first_wins = (0..2000).filter(|_| fight(&mut twin(), &mut twin(), &mut rng)).count();
-        assert!((1000..=1400).contains(&first_wins), "first striker won {first_wins}/2000");
-        let alternating = (0..2000)
-            .filter(|i| if i % 2 == 0 { fight(&mut twin(), &mut twin(), &mut rng) } else { !fight(&mut twin(), &mut twin(), &mut rng) })
-            .count();
-        assert!((900..=1100).contains(&alternating), "with turns alternating, won {alternating}/2000");
-    }
-
     #[test]
     fn opponent_budget_scales_with_rank() {
         let mut rng = Rng(7);
