@@ -242,6 +242,7 @@ struct App {
     retiring: bool, // retirement announced, waiting for the message box
     last_second: u64,
     last_save: u64,
+    save_failed: bool,
 }
 
 thread_local! {
@@ -271,8 +272,13 @@ fn work_area(hwnd: HWND) -> RECT {
     unsafe {
         let mut mi: MONITORINFO = std::mem::zeroed();
         mi.cbSize = size_of::<MONITORINFO>() as u32;
-        GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mut mi);
-        mi.rcWork
+        if GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mut mi) != 0 {
+            return mi.rcWork;
+        }
+        // Monitors can vanish mid-reconfiguration; fall back to the primary work area.
+        let mut r: RECT = std::mem::zeroed();
+        SystemParametersInfoW(SPI_GETWORKAREA, 0, &mut r as *mut RECT as *mut c_void, 0);
+        r
     }
 }
 
@@ -306,6 +312,21 @@ impl App {
         }
     }
 
+    /// Saves, remembering whether it worked so the menu warns until a save succeeds again.
+    fn persist(&mut self) -> bool {
+        let ok = self.pet.save(self.x);
+        self.save_failed = !ok;
+        ok
+    }
+
+    /// Quitting mid-battle counts as running away: the loss is booked before saving.
+    fn forfeit(&mut self) {
+        if self.battle.take().is_some() {
+            self.pet.record_battle(false);
+            unsafe { ShowWindow(self.foe_hwnd, SW_HIDE) };
+        }
+    }
+
     fn busy(&self) -> bool {
         self.pet.asleep || self.battle.is_some() || matches!(self.act, Act::Train(_))
     }
@@ -320,7 +341,7 @@ impl App {
             CMD_FEED | CMD_PLAY => free,
             c if (CMD_TRAIN..CMD_TRAIN + Drill::ALL.len() as i32).contains(&c) => free,
             CMD_BATTLE => free && p.stage() >= Stage::InTraining,
-            CMD_CLEAN => !p.poops.is_empty(),
+            CMD_CLEAN => !p.poops.is_empty() && !scene,
             CMD_SLEEP => p.stage() != Stage::Egg && !scene,
             CMD_RETIRE => !scene && p.stage() >= Stage::Rookie,
             CMD_RESET => !scene,
@@ -353,11 +374,9 @@ impl App {
             self.pet.next_poop = 0;
             self.drop_poop();
         }
-        if t >= self.last_save + 60 {
+        if t >= self.last_save + 60 || t < self.last_save {
             self.last_save = t;
-            if !self.pet.save(self.x) {
-                self.news = "Couldn't save! Check that %APPDATA%\\desklings is writable.".into();
-            }
+            self.persist();
         }
     }
 
@@ -382,7 +401,7 @@ impl App {
         self.evo_flash = 30;
         self.set_act(Act::Show(STAR), 30);
         self.hop(14.0);
-        self.pet.save(self.x);
+        self.persist();
     }
 
     fn choose_next(&mut self) {
@@ -473,7 +492,7 @@ impl App {
                     }
                 }
             }
-            self.x = self.x.clamp(min_x, max_x);
+            self.x = self.x.clamp(min_x, max_x.max(min_x));
         }
         self.render();
     }
@@ -524,7 +543,7 @@ impl App {
             }
         };
         self.set_act(Act::Show(icon), 20);
-        self.pet.save(self.x);
+        self.persist();
     }
 
     // ------------------------------------------------------------------ battles
@@ -638,7 +657,7 @@ impl App {
             self.news = format!("Lost to a wild {foe} (Rank {rank}). Train up and try again!");
             self.set_act(Act::Show(SWEAT), 25);
         }
-        self.pet.save(self.x);
+        self.persist();
     }
 
     // ------------------------------------------------------------------ poop
@@ -704,7 +723,7 @@ impl App {
             self.pet.poops.remove(i);
             unsafe { DestroyWindow(hwnd) };
             self.pet.happy = (self.pet.happy + 2.0).min(100.0);
-            self.pet.save(self.x);
+            self.persist();
         }
     }
 
@@ -876,7 +895,7 @@ impl App {
             }
             _ => return,
         }
-        self.pet.save(self.x);
+        self.persist();
     }
 
     fn farewell(&self) -> String {
@@ -891,16 +910,19 @@ impl App {
     }
 
     fn retire(&mut self) {
-        self.pet.enshrine();
+        let enshrined = self.pet.enshrine();
         self.clean_all();
         let name = self.pet.species.info().name;
         self.pet = self.pet.successor();
         self.news = format!("{name} retired. Generation {} begins!", self.pet.generation);
+        if !enshrined {
+            self.news += " (Couldn't write the Hall of Fame file.)";
+        }
         self.retiring = false;
         self.battle = None;
         unsafe { ShowWindow(self.foe_hwnd, SW_HIDE) };
         self.set_act(Act::Idle, 20);
-        self.pet.save(self.x);
+        self.persist();
     }
 
     fn guide(&self) -> String {
@@ -1003,6 +1025,10 @@ fn show_menu(hwnd: HWND) {
             lines.push(format!("Care mistakes\t{}", p.mistakes));
             let life = if p.elderly() { "Twilight years" } else { "Lifespan" };
             lines.push(format!("Gen {} · {life}\t~{} left", p.generation, duration(p.life_left())));
+        }
+        if a.save_failed {
+            lines.push(String::new());
+            lines.push("⚠ Couldn't save. Check that %APPDATA%\\desklings is writable.".into());
         }
         if !a.news.is_empty() {
             lines.push(String::new());
@@ -1199,11 +1225,21 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             0
         }
         WM_ENDSESSION if wp != 0 => {
-            with_app(|a| a.pet.save(a.x));
+            with_app(|a| {
+                a.forfeit();
+                a.persist()
+            });
             0
         }
         WM_DESTROY => {
-            with_app(|a| a.pet.save(a.x));
+            let saved = with_app(|a| {
+                a.forfeit();
+                a.persist()
+            });
+            if saved == Some(false) {
+                let msg = wide("Desklings couldn't save before closing, so the last minute or so of progress may be lost.");
+                MessageBoxW(null_mut(), msg.as_ptr(), wide("Desklings").as_ptr(), MB_OK | MB_ICONWARNING);
+            }
             PostQuitMessage(0);
             0
         }
@@ -1297,7 +1333,20 @@ fn main() {
         poop_gfx.blit(POOP, 0, 0, false, Pal::default(), false, false);
 
         let wa = work_area(hwnd);
-        let (pet, saved_x, warning) = Pet::load();
+        let (pet, saved_x, warning) = match Pet::load() {
+            Loaded::Fresh => (Pet::new(0), None, None),
+            Loaded::Ok(p, x) => (p, x, None),
+            Loaded::Damaged(p, note) => (p, None, Some(note)),
+            Loaded::Unreadable(why) => {
+                // Starting anyway would autosave a new egg over the real pet.
+                let msg = format!(
+                    "Desklings couldn't open its save file:\n{why}\n\nIt will close now rather than risk overwriting your pet. \
+                     Try again in a moment; if it keeps happening, check that nothing else has the file open."
+                );
+                MessageBoxW(null_mut(), wide(&msg).as_ptr(), wide("Desklings").as_ptr(), MB_OK | MB_ICONWARNING);
+                return;
+            }
+        };
         let mut app = App {
             hwnd,
             canvas,
@@ -1322,6 +1371,7 @@ fn main() {
             retiring: false,
             last_second: now(),
             last_save: now(),
+            save_failed: false,
         };
         for (x, y) in std::mem::take(&mut app.pet.poops) {
             if let Some(landed) = app.spawn_poop(x, y) {

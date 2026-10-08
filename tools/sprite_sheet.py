@@ -1,7 +1,8 @@
 """Validate src/sprites.rs and render a labelled sprite sheet.
 
 Usage: python tools/sprite_sheet.py src/sprites.rs docs/sprites.png [NAME,NAME,...]
-Requires Pillow. Palettes mirror the species table in src/monster.rs - keep them in sync.
+Requires Pillow. Species palettes are read from src/monster.rs; the FIXED colours below mirror
+Surface::blit in src/main.rs, so keep those in sync by hand.
 """
 import pathlib, re, sys
 from PIL import Image, ImageDraw

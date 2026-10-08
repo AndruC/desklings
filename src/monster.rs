@@ -359,17 +359,25 @@ pub fn can_evolve(sp: Species) -> bool {
     evolution(sp, &[STAT_MAX; 5], 0, u32::MAX).is_some()
 }
 
-/// Player-facing description of where `sp` can go next, built from the same thresholds
-/// `evolution` uses so the two can't drift apart.
+/// "1 day", "2 days", "1 hour"...: how long a stage lasts, for the guide.
+fn stage_time(stage: Stage) -> String {
+    let secs = stage.duration().unwrap_or(0);
+    let (n, unit) = if secs % 86_400 == 0 { (secs / 86_400, "day") } else { (secs / 3600, "hour") };
+    format!("{n} {unit}{}", if n == 1 { "" } else { "s" })
+}
+
+/// Player-facing description of where `sp` can go next. The numbers and durations come from
+/// the same constants `evolution` uses; tests check the tie-break wording matches too.
 pub fn paths(sp: Species) -> String {
     use Species::*;
     let dud = format!("Grumbloo if {CHAMPION_DUD_MISTAKES}+ care mistakes or total stats under {CHAMPION_MIN_TOTAL}");
+    let (as_rookie, as_champion) = (stage_time(Stage::Rookie), stage_time(Stage::Champion));
     let rookie = |a: &str, b: &str, hi: &str, lo: &str| {
-        format!("After 1 day as a Rookie:\n  • {a} if {hi} ≥ {lo}\n  • {b} if {lo} > {hi}\n  • {dud}")
+        format!("After {as_rookie} as a Rookie:\n  • {a} if {hi} ≥ {lo}\n  • {b} if {lo} > {hi}\n  • {dud}")
     };
     let champion = |into: &str| {
         format!(
-            "After 2 days as a Champion, becomes {into} with {ULTIMATE_MIN_TOTAL}+ total stats, \
+            "After {as_champion} as a Champion, becomes {into} with {ULTIMATE_MIN_TOTAL}+ total stats, \
              {ULTIMATE_MIN_WINS}+ battle wins and no more than {ULTIMATE_MAX_MISTAKES} care mistakes."
         )
     };
@@ -631,6 +639,80 @@ mod tests {
         assert!(champ.contains(&format!("{ULTIMATE_MIN_TOTAL}+ total")));
         assert!(champ.contains(&format!("{ULTIMATE_MIN_WINS}+ battle wins")));
         assert!(champ.contains(&format!("more than {ULTIMATE_MAX_MISTAKES} care")));
+    }
+
+    #[test]
+    fn guide_names_the_tie_winner_and_real_durations() {
+        use Species::*;
+        for (sp, hi, lo) in [(Raptin, POW, DEF), (Fluffin, SPD, WIS), (Shellby, DEF, LIFE)] {
+            let mut s = [60; 5];
+            s[hi] = 80;
+            s[lo] = 80;
+            let winner = evolution(sp, &s, 0, 0).unwrap();
+            let text = paths(sp);
+            let tie_line = text.lines().find(|l| l.contains('≥')).unwrap();
+            assert!(tie_line.contains(winner.info().name), "{sp:?}: tie goes to {winner:?} but guide says {tie_line:?}");
+            assert!(text.starts_with(&format!("After {} as a Rookie", stage_time(Stage::Rookie))));
+        }
+        assert!(paths(Pyrorex).starts_with(&format!("After {} as a Champion", stage_time(Stage::Champion))));
+        assert_eq!(stage_time(Stage::Rookie), "1 day");
+        assert_eq!(stage_time(Stage::InTraining), "1 hour");
+    }
+
+    /// Mean main-stat gain by outcome over many sessions.
+    fn gains(happy: f32, elderly: bool, rng: &mut Rng) -> (f32, f32, usize) {
+        let (mut good, mut great, mut n_good, mut n_great) = (0u32, 0u32, 0, 0);
+        for _ in 0..4000 {
+            match train(Drill::Lift, Species::Raptin, &mut [10; 5], happy, elderly, rng) {
+                (Outcome::Good, g, _) => (good, n_good) = (good + g as u32, n_good + 1),
+                (Outcome::Great, g, _) => (great, n_great) = (great + g as u32, n_great + 1),
+                (Outcome::Fail, ..) => {}
+            }
+        }
+        (good as f32 / n_good as f32, great as f32 / n_great as f32, n_great)
+    }
+
+    #[test]
+    fn great_sessions_double_gains_and_come_from_happiness() {
+        let mut rng = Rng(42);
+        let (good, great, greats_happy) = gains(100.0, false, &mut rng);
+        assert!((1.8..2.2).contains(&(great / good)), "great/good gain ratio {}", great / good);
+        let (_, _, greats_ok) = gains(79.0, false, &mut rng);
+        assert!(greats_happy > greats_ok + 100, "happy {greats_happy} vs content {greats_ok} great sessions");
+    }
+
+    #[test]
+    fn elderly_gain_half_as_much() {
+        let mut rng = Rng(43);
+        let (young, ..) = gains(100.0, false, &mut rng);
+        let (old, ..) = gains(100.0, true, &mut rng);
+        assert!((0.4..0.6).contains(&(old / young)), "elderly/young gain ratio {}", old / young);
+    }
+
+    #[test]
+    fn speed_hits_defense_soaks_crits_hurt() {
+        let mut rng = Rng(44);
+        let f = |pow: u16, def: u16, spd: u16, wis: u16| Fighter::new(Species::Raptin, [50, pow, def, spd, wis]);
+        let mut sample = |a: &Fighter, d: &Fighter| {
+            let (mut hits, mut hit_dmg, mut crits, mut crit_dmg) = (0, 0, 0, 0);
+            for _ in 0..4000 {
+                match attack(a, d, &mut rng) {
+                    Hit::Hit(x) => (hits, hit_dmg) = (hits + 1, hit_dmg + x),
+                    Hit::Crit(x) => (crits, crit_dmg) = (crits + 1, crit_dmg + x),
+                    Hit::Miss => {}
+                }
+            }
+            let rate = (hits + crits) as f32 / 4000.0;
+            (rate, hit_dmg as f32 / hits.max(1) as f32, crit_dmg as f32 / crits.max(1) as f32)
+        };
+        let (fast, _, _) = sample(&f(50, 50, 200, 10), &f(50, 50, 10, 10));
+        let (slow, _, _) = sample(&f(50, 50, 10, 10), &f(50, 50, 200, 10));
+        assert!(fast > slow + 0.15, "hit rate fast {fast} vs slow {slow}");
+        let (_, soft, _) = sample(&f(100, 50, 50, 10), &f(50, 0, 50, 10));
+        let (_, hard, _) = sample(&f(100, 50, 50, 10), &f(50, 200, 50, 10));
+        assert!(soft > hard * 2.0, "damage vs Defense 0: {soft}, vs 200: {hard}");
+        let (_, hit, crit) = sample(&f(100, 50, 50, 300), &f(50, 50, 50, 10));
+        assert!((1.6..1.9).contains(&(crit / hit)), "crit/hit damage ratio {}", crit / hit);
     }
 
     #[test]

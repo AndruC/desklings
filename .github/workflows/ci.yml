@@ -1,0 +1,23 @@
+# Runs the tests on every push to main and every pull request, on current stable Rust and on the
+# oldest version Cargo.toml promises to support.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        toolchain: [stable, "1.80"]
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust ${{ matrix.toolchain }}
+        run: rustup toolchain install ${{ matrix.toolchain }} --profile minimal
+
+      - name: Test
+        run: cargo +${{ matrix.toolchain }} test --release --locked

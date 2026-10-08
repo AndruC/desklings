@@ -36,10 +36,15 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # Safe to re-run: if an earlier attempt already made the draft, just replace its exe.
+          if gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" target/release/desklings.exe --clobber
+          else
           gh release create "$GITHUB_REF_NAME" target/release/desklings.exe --draft \
             --title "Desklings $GITHUB_REF_NAME" \
             --generate-notes \
             --notes "Download **desklings.exe** below and run it. No installer needed; it saves to \`%APPDATA%\desklings\`.
 
           Windows may show a SmartScreen warning because the exe isn't code-signed: click **More info → Run anyway**."
+          fi
           gh release edit "$GITHUB_REF_NAME" --draft=false

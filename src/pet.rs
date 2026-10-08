@@ -232,13 +232,20 @@ impl Pet {
         Some(Pet::dir()?.join("halloffame.txt"))
     }
 
-    /// Adds this monster to the Hall of Fame file.
-    pub fn enshrine(&self) {
+    /// Adds this monster to the Hall of Fame file, once: each line ends with a hidden ` #<born>`
+    /// tag so a retirement interrupted before the save is not recorded twice. Returns false if
+    /// the file couldn't be written.
+    pub fn enshrine(&self) -> bool {
         use std::io::Write;
-        let Some(path) = Pet::hall_path() else { return };
+        let Some(path) = Pet::hall_path() else { return false };
+        let tag = format!(" #{}", self.born);
+        let existing = std::fs::read_to_string(&path).unwrap_or_default();
+        if existing.lines().any(|l| l.ends_with(&tag)) {
+            return true;
+        }
         let info = self.species.info();
         let line = format!(
-            "Gen {} · {} ({}) · lived {}d · Rank {} · {}W {}L · stats {} (total {})\n",
+            "Gen {} · {} ({}) · lived {}d · Rank {} · {}W {}L · stats {} (total {}){tag}\n",
             self.generation,
             info.name,
             info.stage.name(),
@@ -249,15 +256,19 @@ impl Pet {
             self.stats.map(|v| v.to_string()).join("/"),
             total(&self.stats),
         );
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-            let _ = f.write_all(line.as_bytes());
-        }
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .and_then(|mut f| f.write_all(line.as_bytes()))
+            .is_ok()
     }
 
     /// The most recent Hall of Fame entries, newest first.
     pub fn hall_of_fame(limit: usize) -> Vec<String> {
         let text = Pet::hall_path().and_then(|p| std::fs::read_to_string(p).ok()).unwrap_or_default();
-        text.lines().rev().take(limit).map(str::to_string).collect()
+        let shown = |l: &str| l.rsplit_once(" #").map_or(l, |(entry, _)| entry).to_string();
+        text.lines().rev().take(limit).map(shown).collect()
     }
 
     /// Writes the save to a temp file, flushes it to disk, then swaps it in, so a crash or power
@@ -308,65 +319,78 @@ impl Pet {
     }
 
     /// Parses a save file. Missing keys fall back to defaults so older saves keep loading, but a
-    /// file that looks damaged (cut off, impossible birth time, unknown species) is an error.
+    /// file that looks damaged is an error: cut off, a value that doesn't parse, or an unknown
+    /// species. Times later than `now` (clock set back) are pulled in to `now`, not rejected.
     pub fn parse(text: &str, now: u64) -> Result<(Pet, Option<f32>), String> {
-        let mut p = Pet::new(0);
-        let (mut born, mut species, mut seen, mut x, mut saved) = (None, None, None, None, None);
-        let num = |v: &str, default: f32| v.parse::<f32>().ok().filter(|f| f.is_finite()).unwrap_or(default).clamp(0.0, 100.0);
-        for line in text.lines() {
-            let Some((k, v)) = line.split_once('=') else { continue };
-            match k {
-                "born" => born = v.parse::<u64>().ok(),
-                "species" => species = Some(Species::from_name(v).ok_or_else(|| format!("unknown species {v:?}"))?),
-                "stage_since" => p.stage_since = v.parse().unwrap_or(p.stage_since),
-                "stats" => {
-                    let s: Vec<u16> = v.split(',').filter_map(|n| n.parse().ok()).collect();
-                    if s.len() == 5 {
-                        for (dst, src) in p.stats.iter_mut().zip(s) {
-                            *dst = src.min(STAT_MAX);
-                        }
-                    }
-                }
-                "full" => p.full = num(v, p.full),
-                "happy" => p.happy = num(v, p.happy),
-                "energy" => p.energy = num(v, p.energy),
-                "poops" => {
-                    p.poops = v
-                        .split(',')
-                        .filter_map(|xy| xy.split_once(':'))
-                        .filter_map(|(x, y)| Some((x.parse().ok()?, y.parse().ok()?)))
-                        .take(MAX_POOPS)
-                        .collect()
-                }
-                "asleep" => p.asleep = v == "1",
-                "next_poop" => p.next_poop = v.parse().unwrap_or(0),
-                "mistakes" => p.mistakes = v.parse().unwrap_or(0),
-                "flags" => {
-                    let f: u8 = v.parse().unwrap_or(0);
-                    p.starving = f & 1 != 0;
-                    p.sulking = f & 2 != 0;
-                }
-                "wins" => p.wins = v.parse().unwrap_or(0),
-                "losses" => p.losses = v.parse().unwrap_or(0),
-                "rank" => p.rank = v.parse::<u8>().unwrap_or(0).min(RANKS.len() as u8 - 1),
-                "rank_wins" => p.rank_wins = v.parse().unwrap_or(0),
-                "seen" => seen = v.parse().ok(),
-                "generation" => p.generation = v.parse().unwrap_or(1).max(1),
-                "life_mod" => p.life_mod = v.parse().unwrap_or(0),
-                "care_day" => p.care_day = v.parse().unwrap_or(0),
-                "mistakes_mark" => p.mistakes_mark = v.parse().unwrap_or(0),
-                "x" => x = v.parse::<f32>().ok().filter(|f| f.is_finite()),
-                "saved" => saved = v.parse::<u64>().ok(),
-                _ => {}
-            }
+        fn val<T: std::str::FromStr>(k: &str, v: &str) -> Result<T, String> {
+            v.parse().map_err(|_| format!("bad {k}= value {v:?}"))
         }
-
+        fn need(k: &str, v: &str) -> Result<f32, String> {
+            let f: f32 = val(k, v)?;
+            if f.is_finite() { Ok(f.clamp(0.0, 100.0)) } else { Err(format!("bad {k}= value {v:?}")) }
+        }
         // Every save ends with `saved=...` and a newline; anything else was cut off mid-write.
         if !text.ends_with('\n') {
             return Err("file ends mid-line (truncated?)".into());
         }
+        let mut p = Pet::new(0);
+        let (mut born, mut species, mut seen, mut x, mut saved) = (None, None, None, None, None);
+        for line in text.lines() {
+            let Some((k, v)) = line.split_once('=') else { continue };
+            match k {
+                "born" => born = Some(val::<u64>(k, v)?),
+                "species" => species = Some(Species::from_name(v).ok_or_else(|| format!("unknown species {v:?}"))?),
+                "stage_since" => p.stage_since = val(k, v)?,
+                "stats" => {
+                    let s = v.split(',').map(|n| val::<u16>(k, n)).collect::<Result<Vec<_>, _>>()?;
+                    if s.len() != 5 {
+                        return Err(format!("stats= has {} values, not 5", s.len()));
+                    }
+                    for (dst, src) in p.stats.iter_mut().zip(s) {
+                        *dst = src.min(STAT_MAX);
+                    }
+                }
+                "full" => p.full = need(k, v)?,
+                "happy" => p.happy = need(k, v)?,
+                "energy" => p.energy = need(k, v)?,
+                // The very first save format stored just a count, with no positions to restore.
+                "poops" if v.is_empty() || (!v.contains(':') && v.parse::<u8>().is_ok()) => p.poops.clear(),
+                "poops" => {
+                    p.poops = v
+                        .split(',')
+                        .map(|xy| {
+                            let (x, y) = xy.split_once(':').ok_or_else(|| format!("bad poops= entry {xy:?}"))?;
+                            Ok((val(k, x)?, val(k, y)?))
+                        })
+                        .collect::<Result<Vec<_>, String>>()?;
+                    p.poops.truncate(MAX_POOPS);
+                }
+                "asleep" => p.asleep = val::<u8>(k, v)? != 0,
+                "next_poop" => p.next_poop = val(k, v)?,
+                "mistakes" => p.mistakes = val(k, v)?,
+                "flags" => {
+                    let f: u8 = val(k, v)?;
+                    p.starving = f & 1 != 0;
+                    p.sulking = f & 2 != 0;
+                }
+                "wins" => p.wins = val(k, v)?,
+                "losses" => p.losses = val(k, v)?,
+                "rank" => p.rank = val::<u8>(k, v)?.min(RANKS.len() as u8 - 1),
+                "rank_wins" => p.rank_wins = val(k, v)?,
+                "seen" => seen = Some(val(k, v)?),
+                "generation" => p.generation = val::<u32>(k, v)?.max(1),
+                "life_mod" => p.life_mod = val(k, v)?,
+                "care_day" => p.care_day = val(k, v)?,
+                "mistakes_mark" => p.mistakes_mark = val(k, v)?,
+                "x" => x = Some(val::<f32>(k, v)?).filter(|f| f.is_finite()),
+                "saved" => saved = Some(val::<u64>(k, v)?),
+                _ => {}
+            }
+        }
+
         let saved = saved.ok_or("no saved= line (file truncated?)")?;
-        p.born = born.filter(|&b| b <= now).ok_or("missing or impossible born=")?;
+        p.born = born.ok_or("no born= line")?.min(now);
+        p.stage_since = p.stage_since.min(now);
         p.species = match species {
             Some(s) => s,
             // Saves from before evolution paths: carry on as whatever its age implies.
@@ -388,13 +412,36 @@ impl Pet {
         Ok((p, x))
     }
 
-    /// Loads the saved pet. A damaged save is kept aside as `state.bad.<time>.txt`
-    /// and a new egg starts instead, keeping the collection if it can be read. The message says why.
-    pub fn load() -> (Pet, Option<f32>, Option<String>) {
-        let Some(path) = Pet::path() else { return (Pet::new(0), None, None) };
-        let Ok(text) = std::fs::read_to_string(&path) else { return (Pet::new(0), None, None) };
-        match Pet::parse(&text, now()) {
-            Ok((p, x)) => (p, x, None),
+    /// Loads the saved pet.
+    ///
+    /// - No save file: a new egg.
+    /// - A damaged save is kept aside as `state.bad.<time>.txt` and a new egg starts, keeping the
+    ///   collection if it can be read; `Damaged` carries the message for the player.
+    /// - A save that exists but can't be read (locked by another program, permissions) is
+    ///   `Unreadable`: the caller must not start, or its autosave would overwrite the real save.
+    pub fn load() -> Loaded {
+        let Some(path) = Pet::path() else { return Loaded::Fresh };
+        let mut tries = 0;
+        let bytes = loop {
+            match std::fs::read(&path) {
+                Ok(b) => break b,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Loaded::Fresh,
+                // Antivirus and backup tools hold files briefly; give them a moment.
+                Err(_) if tries < 10 => {
+                    tries += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(300));
+                }
+                Err(e) => return Loaded::Unreadable(format!("{} ({e})", path.display())),
+            }
+        };
+        let text = String::from_utf8_lossy(&bytes);
+        let parsed = if text.contains('\u{FFFD}') {
+            Err("unreadable characters in the file".to_string())
+        } else {
+            Pet::parse(&text, now())
+        };
+        match parsed {
+            Ok((p, x)) => Loaded::Ok(p, x),
             Err(why) => {
                 // Keep every damaged save under its own name; copying works even if moving doesn't.
                 let bad = path.with_file_name(format!("state.bad.{}.txt", now()));
@@ -405,10 +452,17 @@ impl Pet {
                 } else {
                     format!("Save file was damaged ({why}) and couldn't be backed up.")
                 };
-                (Pet::new(seen), None, Some(note))
+                Loaded::Damaged(Pet::new(seen), note)
             }
         }
     }
+}
+
+pub enum Loaded {
+    Fresh,
+    Ok(Pet, Option<f32>),
+    Damaged(Pet, String),
+    Unreadable(String),
 }
 
 #[cfg(test)]
@@ -541,8 +595,6 @@ mod tests {
         assert!(Pet::parse(cut, NOW).is_err(), "cut-off file must not load");
         assert!(Pet::parse("", NOW).is_err());
         assert!(Pet::parse("born=17", NOW).is_err());
-        let future = text.replace(&format!("born={}", NOW - 3 * DAY), &format!("born={}", NOW + 10));
-        assert!(Pet::parse(&future, NOW).is_err());
         let renamed = text.replace("species=Mystifur", "species=Mystimon");
         assert!(Pet::parse(&renamed, NOW).is_err(), "unknown species must not be treated as a legacy save");
     }
@@ -571,11 +623,106 @@ saved={NOW}
 
     #[test]
     fn loaded_values_are_clamped() {
-        let text = sample().serialize(0.0, NOW).replace("stats=70,50,60,90,140", "stats=1200,5,65535,0,999").replace("full=42.5", "full=NaN").replace("happy=77", "happy=-5");
+        let text = sample().serialize(0.0, NOW).replace("stats=70,50,60,90,140", "stats=1200,5,65535,0,999").replace("happy=77", "happy=-5");
         let (p, _) = Pet::parse(&text, NOW).unwrap();
         assert_eq!(p.stats, [999, 5, 999, 0, 999]);
-        assert_eq!(p.full, 80.0);
         assert_eq!(p.happy, 0.0);
+    }
+
+    #[test]
+    fn present_but_garbled_values_are_damage() {
+        let text = sample().serialize(0.0, NOW);
+        for (from, to) in [
+            ("stats=70,50,60,90,140", "stats=70,50,60,9O,140"),
+            ("stats=70,50,60,90,140", "stats=70,50,60,90"),
+            ("generation=4", "generation=4x"),
+            ("full=42.5", "full=NaN"),
+            ("wins=7", "wins=seven"),
+            ("asleep=1", "asleep=yes"),
+            ("poops=100:200,-50:1300", "poops=100:200,-50"),
+        ] {
+            assert!(Pet::parse(&text.replace(from, to), NOW).is_err(), "{to} should be rejected");
+        }
+    }
+
+    #[test]
+    fn clock_set_back_is_not_damage() {
+        let text = sample().serialize(0.0, NOW);
+        let (p, _) = Pet::parse(&text, NOW - 5 * DAY).expect("a clock behind the save must still load");
+        assert_eq!(p.born, NOW - 5 * DAY);
+        assert!(p.stage_since <= NOW - 5 * DAY);
+    }
+
+    #[test]
+    fn first_format_poop_count_still_loads() {
+        let text = format!("born={}\nfull=50\nhappy=60\nenergy=70\npoops=2\nasleep=0\nnext_poop=0\nx=5\nsaved={NOW}\n", NOW - 600);
+        let (p, _) = Pet::parse(&text, NOW).unwrap();
+        assert!(p.poops.is_empty());
+    }
+
+    #[test]
+    fn sulking_is_one_mistake_per_episode() {
+        let mut p = sample();
+        p.asleep = false;
+        p.full = 100.0;
+        p.happy = 0.001;
+        p.sulking = false;
+        let before = p.mistakes;
+        for _ in 0..100 {
+            p.live_second(true);
+        }
+        assert_eq!(p.mistakes, before + 1);
+    }
+
+    #[test]
+    fn needs_drain_at_the_documented_rates() {
+        let fresh = || {
+            let mut p = sample();
+            p.asleep = false;
+            p.poops.clear();
+            p.full = 80.0;
+            p.happy = 80.0;
+            p.energy = 80.0;
+            p.born = NOW; // young, so not elderly
+            p.life_mod = 0;
+            p
+        };
+        let close = |a: f32, b: f32| (a - b).abs() < 1e-4;
+        let drop = |p: &mut Pet| {
+            let (f, h, e) = (p.full, p.happy, p.energy);
+            p.live_second(false);
+            (f - p.full, h - p.happy, e - p.energy)
+        };
+
+        let (df, dh, de) = drop(&mut fresh());
+        assert!(close(df, FULL_RATE) && close(dh, HAPPY_RATE) && close(de, TIRE_RATE));
+
+        let mut messy = fresh();
+        messy.poops = vec![(0, 0), (1, 1)];
+        assert!(close(drop(&mut messy).1, 3.0 * HAPPY_RATE), "two poops triple the sadness");
+
+        let mut hungry = fresh();
+        hungry.full = 10.0;
+        assert!(close(drop(&mut hungry).1, 2.0 * HAPPY_RATE), "hunger doubles it");
+
+        let mut sleepy = fresh();
+        sleepy.asleep = true;
+        let (df, dh, de) = drop(&mut sleepy);
+        assert!(close(df, 0.5 * FULL_RATE) && close(dh, 0.5 * HAPPY_RATE) && close(de, -REST_RATE));
+
+        let mut old = fresh();
+        old.born = now() - old.lifespan() * 9 / 10; // age is measured against the real clock
+        assert!(old.elderly());
+        let (_, _, de) = drop(&mut old);
+        assert!(close(de, 1.5 * TIRE_RATE), "elderly tire faster");
+    }
+
+    #[test]
+    fn grumbloo_lives_shorter() {
+        let mut p = Pet::new(0);
+        let normal = p.lifespan();
+        p.species = Species::Grumbloo;
+        assert_eq!(p.lifespan(), normal * 3 / 4);
     }
 
     #[test]
