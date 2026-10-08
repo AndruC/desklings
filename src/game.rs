@@ -116,7 +116,7 @@ pub struct Game {
 
 impl Game {
     pub fn new(pet: Pet, seed: u64) -> Game {
-        Game {
+        let mut g = Game {
             pet,
             act: Act::Idle,
             act_t: 20,
@@ -126,6 +126,15 @@ impl Game {
             retiring: false,
             evo_flash: 0,
             rng: Rng(seed | 1),
+        };
+        g.greet(); // it may have waited for you while the app was closed
+        g
+    }
+
+    /// If the pet just used its grace period, tell the player.
+    fn greet(&mut self) {
+        if std::mem::take(&mut self.pet.came_back) {
+            self.news = format!("{} waited for you to come back. It doesn't have long left, so make its last days count.", self.pet.species.info().name);
         }
     }
 
@@ -171,7 +180,17 @@ impl Game {
         let gap = now.saturating_sub(last);
         if gap > CATCH_UP_LIMIT {
             self.pet.catch_up(gap);
-            return self.second(now, standing);
+            self.pet.review_day(now); // credit the days away first...
+            self.pet.welcome_back(last, now); // ...then see whether it still needed to wait
+            let before = self.news.clone();
+            let ev = self.second(now, standing);
+            let happened = if self.news != before { std::mem::take(&mut self.news) } else { String::new() };
+            self.greet();
+            // Keep anything else that happened on return (e.g. it evolved) alongside the greeting.
+            if !happened.is_empty() {
+                self.news = if self.news.is_empty() { happened } else { format!("{} {happened}", self.news) };
+            }
+            return ev;
         }
         (1..=gap).flat_map(|s| self.second(last + s, standing)).collect()
     }
@@ -769,6 +788,26 @@ mod tests {
     }
 
     #[test]
+    fn evolution_and_retirement_wait_until_its_free_and_standing() {
+        let mut g = game(Species::Blop);
+        g.pet.stage_since = NOW - 10 * 3600;
+        g.command(CMD_BATTLE, NOW);
+        g.second(NOW, true);
+        assert_eq!(g.pet.species, Species::Blop, "mustn't evolve mid-battle");
+        g.battle = None;
+        g.act = Act::Idle;
+        g.second(NOW, false);
+        assert_eq!(g.pet.species, Species::Blop, "mustn't evolve mid-air");
+        g.second(NOW, true);
+        assert_ne!(g.pet.species, Species::Blop);
+
+        let mut old = game(Species::Raptin);
+        old.pet.born = NOW - 60 * 86_400;
+        assert!(!old.second(NOW, false).contains(&Event::Retire), "not mid-air");
+        assert!(old.second(NOW, true).contains(&Event::Retire));
+    }
+
+    #[test]
     fn evolution_waits_for_training_and_battles() {
         let mut g = game(Species::Blop);
         g.pet.stage_since = NOW - 10 * 3600; // long overdue
@@ -829,6 +868,48 @@ mod tests {
 
         g.advance(NOW + 121, NOW + 121 + 1801, true);
         assert!(energy(&g) > 99.0, "a long gap counts as a full rest");
+    }
+
+    #[test]
+    fn overwork_costs_lifespan_only_when_tired() {
+        let mut fresh = game(Species::Raptin);
+        let life = fresh.pet.lifespan();
+        fresh.command(CMD_TRAIN, NOW);
+        assert_eq!(fresh.pet.lifespan(), life, "rested: no cost");
+
+        let mut tired = game(Species::Raptin);
+        tired.pet.energy = 25.0;
+        let life = tired.pet.lifespan();
+        tired.command(CMD_TRAIN, NOW);
+        assert_eq!(tired.pet.lifespan(), life - OVERWORK_COST as u64);
+        tired.act = Act::Idle;
+        tired.pet.energy = 25.0;
+        tired.command(CMD_BATTLE, NOW);
+        assert_eq!(tired.pet.lifespan(), life - 2 * OVERWORK_COST as u64, "battling tired costs too");
+    }
+
+    #[test]
+    fn medium_gaps_drain_gently_without_a_full_rest() {
+        let mut g = game(Species::Raptin);
+        g.pet.energy = 50.0;
+        g.pet.full = 80.0;
+        g.advance(NOW, NOW + 600, true); // 10 minutes: caught up, not replayed
+        assert!(g.pet.energy < 50.0, "10 minutes away isn't a night's sleep");
+        assert!((80.0 - g.pet.full - 600.0 * FULL_RATE * 0.5).abs() < 0.05, "half-speed hunger: {}", g.pet.full);
+    }
+
+    #[test]
+    fn a_long_absence_while_running_gets_the_grace_once() {
+        let mut g = game(Species::Raptin);
+        g.pet.born = NOW - 10 * 86_400;
+        let back = NOW + 40 * 86_400;
+        let ev = g.advance(NOW, back, true);
+        assert!(!ev.contains(&Event::Retire), "it waits for you");
+        assert_eq!(g.pet.life_left_at(back), GRACE);
+        assert!(g.news.contains("waited for you"), "{}", g.news);
+        assert!(g.news.contains("evolved"), "and the evolution on return isn't lost: {}", g.news);
+        let ev = g.advance(back, back + 30 * 86_400, true);
+        assert!(ev.contains(&Event::Retire), "but only once");
     }
 
     #[test]

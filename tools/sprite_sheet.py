@@ -33,6 +33,8 @@ ok = True
 for name, rows in sprites:
     if not rows:
         print(f'{name} is empty'); ok = False; continue
+    if not any(r.strip('.') for r in rows):
+        print(f'{name} is blank (every pixel transparent)'); ok = False; continue
     if name not in LIMITS:
         print(f'{name} has no size limit in LIMITS; add one'); ok = False
     elif len(rows[0]) > LIMITS[name][0] or len(rows) > LIMITS[name][1]:

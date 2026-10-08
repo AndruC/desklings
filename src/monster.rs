@@ -384,7 +384,11 @@ pub fn paths(sp: Species) -> String {
     match sp {
         Egg => "Hatches into Blip.".into(),
         Blip => "Grows into Blop.".into(),
-        Blop => "Becomes a Rookie based on its best stat:\n  • Power → Raptin\n  • Speed or Wisdom → Fluffin\n  • Defense or Life → Shellby".into(),
+        Blop => format!(
+            "After {} as In-Training, becomes a Rookie based on its best stat (a tie goes to the one listed first):\n  \
+             • Power → Raptin\n  • Speed or Wisdom → Fluffin\n  • Defense or Life → Shellby",
+            stage_time(Stage::InTraining)
+        ),
         Raptin => rookie("Pyrorex", "Cragdon", "Power", "Defense"),
         Fluffin => rookie("Galewing", "Mystifur", "Speed", "Wisdom"),
         Shellby => rookie("Bulwark", "Tidecrest", "Defense", "Life"),
@@ -713,6 +717,23 @@ mod tests {
         assert!(soft > hard * 2.0, "damage vs Defense 0: {soft}, vs 200: {hard}");
         let (_, hit, crit) = sample(&f(100, 50, 50, 300), &f(50, 50, 50, 10));
         assert!((1.6..1.9).contains(&(crit / hit)), "crit/hit damage ratio {}", crit / hit);
+    }
+
+    #[test]
+    fn blop_guide_matches_its_tie_rules() {
+        use Species::*;
+        // Listed order in the guide: Power, then Speed/Wisdom, then Defense/Life.
+        let order = [(POW, Raptin), (SPD, Fluffin), (WIS, Fluffin), (DEF, Shellby), (LIFE, Shellby)];
+        for (i, &(a, first)) in order.iter().enumerate() {
+            for &(b, _) in &order[i + 1..] {
+                let mut s = [10; 5];
+                s[a] = 40;
+                s[b] = 40;
+                assert_eq!(evolution(Blop, &s, 0, 0), Some(first), "{} tied with {}", STAT_NAMES[a], STAT_NAMES[b]);
+            }
+        }
+        assert!(paths(Blop).contains("a tie goes to the one listed first"));
+        assert!(paths(Blop).starts_with(&format!("After {} as In-Training", stage_time(Stage::InTraining))));
     }
 
     #[test]

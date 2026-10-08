@@ -44,6 +44,8 @@ pub struct Pet {
     pub care_day: u64,      // last day of age that was checked for a mistake-free bonus
     pub mistakes_mark: u32, // mistakes count at the start of that day
     pub asleep_since: u64,  // when it last went to sleep (not saved: a reload starts the nap afresh)
+    pub waited: bool,       // already used its one "waited for you" grace period
+    pub came_back: bool,    // just used it (not saved; the game shows a message)
 }
 
 const DAY: u64 = 86_400;
@@ -52,6 +54,8 @@ const MIN_LIFESPAN: u64 = 4 * DAY;
 pub const MISTAKE_COST: i64 = 12 * 3600;
 pub const OVERWORK_COST: i64 = 3 * 3600;
 const GOOD_DAY_BONUS: i64 = 12 * 3600;
+/// If its life runs out while you're away, it hangs on this long after you're back (once).
+pub const GRACE: u64 = 3 * DAY;
 
 impl Pet {
     /// A new egg laid at time `t`.
@@ -80,6 +84,8 @@ impl Pet {
             care_day: 0,
             mistakes_mark: 0,
             asleep_since: 0,
+            waited: false,
+            came_back: false,
         }
     }
 
@@ -109,8 +115,11 @@ impl Pet {
 
     /// Total lifespan in seconds: a base that good care stretches and neglect or overwork shortens.
     pub fn lifespan(&self) -> u64 {
-        let base = if self.species == Species::Grumbloo { BASE_LIFESPAN * 3 / 4 } else { BASE_LIFESPAN };
-        (base as i64 + self.life_mod).max(MIN_LIFESPAN as i64) as u64
+        (self.base_lifespan() as i64 + self.life_mod).max(MIN_LIFESPAN as i64) as u64
+    }
+
+    fn base_lifespan(&self) -> u64 {
+        if self.species == Species::Grumbloo { BASE_LIFESPAN * 3 / 4 } else { BASE_LIFESPAN }
     }
 
     pub fn life_left_at(&self, now: u64) -> u64 {
@@ -227,8 +236,26 @@ impl Pet {
         }
     }
 
+    /// After time away from `left` to `now`: if its life ran out in the meantime, it waits for
+    /// you, with GRACE left to say goodbye. Only once per monster, so it can't be stretched
+    /// forever by closing the app. Returns whether it waited.
+    pub fn welcome_back(&mut self, left: u64, now: u64) -> bool {
+        if self.waited || self.life_left_at(left) == 0 || self.life_left_at(now) >= GRACE {
+            return false;
+        }
+        // Its life now ends GRACE from now, however long ago it would have ended.
+        self.life_mod = (self.age_at(now) + GRACE) as i64 - self.base_lifespan() as i64;
+        self.waited = true;
+        self.came_back = true;
+        true
+    }
+
     fn dir() -> Option<std::path::PathBuf> {
-        let appdata = std::path::PathBuf::from(std::env::var_os("APPDATA")?);
+        Pet::resolve_dir(std::path::Path::new(&std::env::var_os("APPDATA")?))
+    }
+
+    /// The save folder under `appdata`, moving one left by the project's original name.
+    fn resolve_dir(appdata: &std::path::Path) -> Option<std::path::PathBuf> {
         let dir = appdata.join("desklings");
         let old = appdata.join("digidesktop"); // the project's original name
         if !dir.exists() && old.exists() && std::fs::rename(&old, &dir).is_err() {
@@ -238,20 +265,16 @@ impl Pet {
         Some(dir)
     }
 
-    fn path() -> Option<std::path::PathBuf> {
-        Some(Pet::dir()?.join("state.txt"))
-    }
-
-    fn hall_path() -> Option<std::path::PathBuf> {
-        Some(Pet::dir()?.join("halloffame.txt"))
-    }
-
     /// Adds this monster to the Hall of Fame file, once: each line ends with a hidden ` #<born>`
     /// tag so a retirement interrupted before the save is not recorded twice. Returns false if
     /// the file couldn't be written.
     pub fn enshrine(&self, now: u64) -> bool {
+        Pet::dir().is_some_and(|d| self.enshrine_in(&d, now))
+    }
+
+    fn enshrine_in(&self, dir: &std::path::Path, now: u64) -> bool {
         use std::io::Write;
-        let Some(path) = Pet::hall_path() else { return false };
+        let path = dir.join(HALL_FILE);
         let tag = format!(" #{}", self.born);
         // If the file exists but can't be read, don't append: it might already hold this entry.
         let Some(existing) = read_text(&path) else { return false };
@@ -281,7 +304,11 @@ impl Pet {
 
     /// The most recent Hall of Fame entries, newest first.
     pub fn hall_of_fame(limit: usize) -> Vec<String> {
-        let text = Pet::hall_path().and_then(|p| read_text(&p)).unwrap_or_default();
+        Pet::dir().map(|d| Pet::hall_of_fame_in(&d, limit)).unwrap_or_default()
+    }
+
+    fn hall_of_fame_in(dir: &std::path::Path, limit: usize) -> Vec<String> {
+        let text = read_text(&dir.join(HALL_FILE)).unwrap_or_default();
         let shown = |l: &str| l.rsplit_once(" #").map_or(l, |(entry, _)| entry).to_string();
         text.lines().rev().take(limit).map(shown).collect()
     }
@@ -289,11 +316,15 @@ impl Pet {
     /// Writes the save to a temp file, flushes it to disk, then swaps it in, so a crash or power
     /// cut leaves either the old save or the new one. Returns false if it couldn't save.
     pub fn save(&self, x: f32) -> bool {
+        Pet::dir().is_some_and(|d| self.save_in(&d, x, now()))
+    }
+
+    fn save_in(&self, dir: &std::path::Path, x: f32, now: u64) -> bool {
         use std::io::Write;
-        let Some(path) = Pet::path() else { return false };
+        let path = dir.join(SAVE_FILE);
         let tmp = path.with_extension("tmp");
         let written = std::fs::File::create(&tmp).and_then(|mut f| {
-            f.write_all(self.serialize(x, now()).as_bytes())?;
+            f.write_all(self.serialize(x, now).as_bytes())?;
             f.sync_all()
         });
         written.is_ok() && std::fs::rename(&tmp, &path).is_ok()
@@ -306,7 +337,7 @@ impl Pet {
         format!(
             "born={}\nspecies={}\nstage_since={}\nstats={}\nfull={}\nhappy={}\nenergy={}\npoops={}\nasleep={}\n\
              next_poop={}\nmistakes={}\nflags={}\nwins={}\nlosses={}\nrank={}\nrank_wins={}\nseen={}\n\
-             generation={}\nlife_mod={}\ncare_day={}\nmistakes_mark={}\nx={}\nsaved={}\n",
+             generation={}\nlife_mod={}\ncare_day={}\nmistakes_mark={}\nwaited={}\nx={}\nsaved={}\n",
             self.born,
             self.species.info().name,
             self.stage_since,
@@ -328,6 +359,7 @@ impl Pet {
             self.life_mod,
             self.care_day,
             self.mistakes_mark,
+            self.waited as u8,
             x,
             now
         )
@@ -404,6 +436,7 @@ impl Pet {
                 }
                 "care_day" => p.care_day = val(k, v)?,
                 "mistakes_mark" => p.mistakes_mark = val(k, v)?,
+                "waited" => p.waited = val::<u8>(k, v)? != 0,
                 "x" => {
                     let f: f32 = val(k, v)?;
                     if !f.is_finite() {
@@ -461,6 +494,11 @@ impl Pet {
             p.care_day = age / DAY;
         }
         p.catch_up(now.saturating_sub(saved));
+        p.review_day(now); // credit the days away first...
+        p.welcome_back(saved, now); // ...then see whether it still needed to wait
+        if p.asleep {
+            p.asleep_since = now; // a nap in progress starts afresh rather than ending at once
+        }
         Ok((p, x))
     }
 
@@ -472,7 +510,14 @@ impl Pet {
     /// - A save that exists but can't be read (locked by another program, permissions) is
     ///   `Unreadable`: the caller must not start, or its autosave would overwrite the real save.
     pub fn load() -> Loaded {
-        let Some(path) = Pet::path() else { return Loaded::Fresh };
+        match Pet::dir() {
+            Some(d) => Pet::load_from(&d, now()),
+            None => Loaded::Fresh,
+        }
+    }
+
+    fn load_from(dir: &std::path::Path, now: u64) -> Loaded {
+        let path = dir.join(SAVE_FILE);
         let mut tries = 0;
         let bytes = loop {
             match std::fs::read(&path) {
@@ -490,13 +535,17 @@ impl Pet {
         let parsed = if text.contains('\u{FFFD}') {
             Err("unreadable characters in the file".to_string())
         } else {
-            Pet::parse(&text, now())
+            Pet::parse(&text, now)
         };
         match parsed {
             Ok((p, x)) => Loaded::Ok(p, x),
             Err(why) => {
                 // Keep every damaged save under its own name; copying works even if moving doesn't.
-                let bad = path.with_file_name(format!("state.bad.{}.txt", now()));
+                // Never reuse a name: an earlier backup might hold the only good copy.
+                let bad = (0..)
+                    .map(|i| dir.join(if i == 0 { format!("state.bad.{now}.txt") } else { format!("state.bad.{now}-{i}.txt") }))
+                    .find(|b| !b.exists())
+                    .expect("some name is free");
                 let kept = std::fs::rename(&path, &bad).is_ok() || std::fs::copy(&path, &bad).is_ok();
                 let seen = text.lines().find_map(|l| l.strip_prefix("seen=")?.parse().ok()).unwrap_or(0);
                 if !kept {
@@ -504,11 +553,14 @@ impl Pet {
                     return Loaded::Unreadable(format!("{} is damaged ({why}) and couldn't be backed up", path.display()));
                 }
                 let note = format!("Save file was damaged ({why}); kept a copy as {}.", bad.file_name().unwrap_or_default().to_string_lossy());
-                Loaded::Damaged(Pet::new_at(seen, now()), note)
+                Loaded::Damaged(Pet::new_at(seen, now), note)
             }
         }
     }
 }
+
+const SAVE_FILE: &str = "state.txt";
+const HALL_FILE: &str = "halloffame.txt";
 
 /// Reads a text file, tolerating bytes that aren't UTF-8 (e.g. re-saved as ANSI by an editor).
 /// A missing file reads as empty; any other error is None.
@@ -784,6 +836,120 @@ saved={NOW}
         assert!(text.lines().any(|l| l.ends_with(" #123")), "dedupe tag still found: {text:?}");
         assert_eq!(read_text(&dir.join("missing.txt")), Some(String::new()), "missing file reads as empty");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn it_waits_for_you_once() {
+        // A 10-day-old pet, saved, then the app stays closed for 30 days.
+        let mut p = sample();
+        p.born = NOW - 10 * DAY;
+        p.life_mod = 0;
+        let back = NOW + 30 * DAY;
+        let (q, _) = Pet::parse(&p.serialize(0.0, NOW), back).unwrap();
+        assert_eq!(q.life_left_at(back), GRACE, "it hung on for a goodbye");
+        assert!(q.waited && q.came_back);
+        // Away for long again (good days still count, so it takes a while): no second reprieve.
+        let later = back + 30 * DAY;
+        let (r, _) = Pet::parse(&q.serialize(0.0, back), later).unwrap();
+        assert_eq!(r.life_left_at(later), 0);
+        assert!(!r.came_back);
+        // Even a heavily neglected one (lifespan at its floor) gets the full grace.
+        let mut neglected = sample();
+        neglected.born = NOW - 2 * DAY; // still alive when you left (4-day floor)
+        neglected.life_mod = -100 * DAY as i64;
+        assert!(neglected.welcome_back(NOW, NOW + 30 * DAY));
+        assert_eq!(neglected.life_left_at(NOW + 30 * DAY), GRACE);
+        // A short absence with plenty of life left changes nothing.
+        let mut young = sample();
+        young.born = NOW - DAY;
+        assert!(!young.welcome_back(NOW, NOW + DAY));
+        assert!(!young.waited);
+    }
+
+    #[test]
+    fn a_nap_survives_a_reload() {
+        let mut p = sample();
+        p.asleep = false;
+        p.energy = 100.0;
+        p.sleep_at(NOW);
+        let (mut q, _) = Pet::parse(&p.serialize(0.0, NOW), NOW + 1).unwrap();
+        assert!(q.asleep);
+        assert_eq!(q.live_second(NOW + 2, true), Sleep::Unchanged, "mustn't wake the moment it's loaded");
+    }
+
+    /// A fresh, empty folder for one test.
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("desklings-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn save_then_load_from_disk() {
+        let dir = temp_dir("save");
+        assert!(matches!(Pet::load_from(&dir, NOW), Loaded::Fresh));
+        assert!(sample().save_in(&dir, 42.0, NOW));
+        assert!(!dir.join("state.tmp").exists(), "temp file swapped in, not left behind");
+        match Pet::load_from(&dir, NOW) {
+            Loaded::Ok(p, x) => assert_eq!((p.species, p.wins, x), (Species::Mystifur, 7, Some(42.0))),
+            _ => panic!("expected the saved pet"),
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn damaged_saves_are_kept_never_overwritten() {
+        let dir = temp_dir("damaged");
+        let bad = |n: u8| format!("born=1\ngarbage {n}");
+        std::fs::write(dir.join(SAVE_FILE), bad(1)).unwrap();
+        let Loaded::Damaged(p, note) = Pet::load_from(&dir, NOW) else { panic!("should be damaged") };
+        assert_eq!(p.species, Species::Egg);
+        assert!(note.contains("state.bad."), "{note}");
+        assert!(!dir.join(SAVE_FILE).exists());
+        // A second damaged save in the same second gets its own backup.
+        std::fs::write(dir.join(SAVE_FILE), bad(2)).unwrap();
+        assert!(matches!(Pet::load_from(&dir, NOW), Loaded::Damaged(..)));
+        let mut kept: Vec<String> = std::fs::read_dir(&dir).unwrap().map(|e| std::fs::read_to_string(e.unwrap().path()).unwrap()).collect();
+        kept.sort();
+        assert_eq!(kept, vec![bad(1), bad(2)]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn locked_save_is_unreadable_not_replaced() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = temp_dir("locked");
+        assert!(sample().save_in(&dir, 0.0, NOW));
+        let lock = std::fs::OpenOptions::new().read(true).share_mode(0).open(dir.join(SAVE_FILE)).unwrap();
+        assert!(matches!(Pet::load_from(&dir, NOW), Loaded::Unreadable(_)));
+        drop(lock);
+        assert!(matches!(Pet::load_from(&dir, NOW), Loaded::Ok(..)), "the save is untouched");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn hall_of_fame_records_each_monster_once() {
+        let dir = temp_dir("hall");
+        let p = sample();
+        assert!(p.enshrine_in(&dir, NOW));
+        assert!(p.enshrine_in(&dir, NOW), "a retry is fine...");
+        let hall = Pet::hall_of_fame_in(&dir, 10);
+        assert_eq!(hall.len(), 1, "...but writes nothing new");
+        assert!(hall[0].starts_with("Gen 4 · Mystifur") && !hall[0].contains('#'), "{}", hall[0]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn old_folder_is_moved_to_the_new_name() {
+        let appdata = temp_dir("appdata");
+        std::fs::create_dir_all(appdata.join("digidesktop")).unwrap();
+        std::fs::write(appdata.join("digidesktop").join(SAVE_FILE), "x").unwrap();
+        let dir = Pet::resolve_dir(&appdata).unwrap();
+        assert_eq!(dir, appdata.join("desklings"));
+        assert_eq!(std::fs::read_to_string(dir.join(SAVE_FILE)).unwrap(), "x");
+        assert!(!appdata.join("digidesktop").exists());
+        std::fs::remove_dir_all(&appdata).unwrap();
     }
 
     #[test]
