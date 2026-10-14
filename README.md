@@ -18,7 +18,8 @@ The exe isn't code-signed, so Windows SmartScreen may warn you the first time. C
 - **Needs:** hunger, happiness and energy. It poops a few minutes after eating, and the poop stays where it was dropped. Click a poop to clean it up.
 - **Stats:** Life, Power, Defense, Speed and Wisdom, each up to 999.
 - **Training:** five drills (Run, Lift, Endure, Study, Swim). Happy monsters train better, unhappy ones slack off, and sometimes you get a *Great!* session.
-- **Battles:** a wild monster walks up and the two auto-battle with HP bars. Win to climb ranks E→S.
+- **Battles:** a wild monster walks up and the two auto-battle with HP bars. Win three at a rank to climb E→S, then on through the Master league (Master I–V). From Rank S on, the third win of each rank has to be a title match against that rank's champion, who fights at the next rank's strength.
+- **Rivals:** monsters from your Hall of Fame come back for a rematch (about one battle in four) once you reach a rank whose wild monsters are about as strong as they were. They wear their true colours, unlike wild monsters, and beating a champion or a rival earns a bigger stat bonus.
 - **Evolution:** 16 species across Egg → Fresh → In-Training → Rookie → Champion → Ultimate. The path depends on which stats you train, how well you look after it, and how many battles it has won.
 - **Lifespan and retirement:** a monster starts with two weeks to live. Every day without a care mistake adds half a day, so a well-kept monster lives up to about four weeks. Care mistakes and overwork shorten it. Days with the app closed count as good days, so closing it for a while is never punished, and if its life would run out while you're away it waits for you: you get three days to say goodbye (once per monster). Grumbloo, the neglect evolution, lives a quarter less. Time away of more than half an hour (app closed or PC asleep) counts as a full night's sleep. When you leave the computer on but step away (screensaver, locked, or 10 minutes without input) it dozes off and its needs drift gently, never into care-mistake territory, and it wakes when you're back. Retirees enter the Hall of Fame, and the next egg inherits a tenth of their stats (up to +50 each).
 - **Saves automatically** to `%APPDATA%\desklings\`. While it's closed, needs drain gently and never fall below a safe minimum.
@@ -45,6 +46,20 @@ Any Rookie with 5+ care mistakes or under 150 total stats → Grumbloo
 | Ultimate | 2+ days | Needs 500+ total stats, 5+ wins, ≤ 3 care mistakes |
 
 A **care mistake** is letting it starve, letting its happiness hit zero, or letting poop pile up past three.
+
+## Battle ranks
+
+| Rank | Wild monsters' total stats | Title match to move up |
+|---|---|---|
+| E · D · C · B · A | 60 · 130 · 230 · 360 · 520 | none, three wins each |
+| S | 750 | Titanshell the Gatekeeper |
+| Master I | 950 | Seraphox the Silver Sage |
+| Master II | 1250 | Infernax the Ash King |
+| Master III | 1650 | Titanshell the Living Island |
+| Master IV | 2150 | Infernax the Undying Flame |
+| Master V | 2750 | none, it's the top |
+
+A champion fights with the next rank's total, so it's a real step up. Lose and it waits for you to train and try again.
 
 ## Controls
 

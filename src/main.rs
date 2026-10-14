@@ -570,7 +570,9 @@ impl App {
         }
         let dx = if b.lunge.1 > 0 { -2 * v.side } else { 0 };
         // Sprites face right; a foe on the right has to face left.
-        let top = c.blit_standing(spr, dx, dy, v.side > 0, info.pal.wild(), false, b.flash.1 > 0);
+        // Wild monsters are dimmed; champions and your own retirees wear their true colours.
+        let pal = if b.kind == Foe::Wild { info.pal.wild() } else { info.pal };
+        let top = c.blit_standing(spr, dx, dy, v.side > 0, pal, false, b.flash.1 > 0);
         if !walking {
             c.hp_bar(top, b.foe.hp, b.foe.max_hp);
         }
@@ -585,7 +587,7 @@ struct MenuState {
     lines: Vec<String>,
     enabled: Vec<i32>,
     asleep: bool,
-    rank: &'static str,
+    battle: String,
     born: u64, // identifies the pet, so a confirmation box can't act on its successor
 }
 
@@ -596,7 +598,7 @@ fn show_menu(hwnd: HWND) {
             lines: g.status_lines(now(), a.save_failed),
             enabled: (CMD_FEED..=CMD_LAST).filter(|&c| g.allowed(c)).collect(),
             asleep: g.pet.asleep,
-            rank: RANKS[g.pet.rank as usize],
+            battle: g.battle_label(),
             born: g.pet.born,
         }
     }) else {
@@ -620,8 +622,7 @@ fn show_menu(hwnd: HWND) {
             AppendMenuW(train, MF_STRING, (CMD_TRAIN + i as i32) as usize, wide(d.label()).as_ptr());
         }
         AppendMenuW(m, MF_POPUP | gray(CMD_TRAIN), train as usize, wide("Train").as_ptr());
-        let battle = format!("Battle (Rank {})", st.rank);
-        AppendMenuW(m, MF_STRING | gray(CMD_BATTLE), CMD_BATTLE as usize, wide(&battle).as_ptr());
+        AppendMenuW(m, MF_STRING | gray(CMD_BATTLE), CMD_BATTLE as usize, wide(&st.battle).as_ptr());
         AppendMenuW(m, MF_STRING | gray(CMD_PLAY), CMD_PLAY as usize, wide("Play").as_ptr());
         AppendMenuW(m, MF_STRING | gray(CMD_CLEAN), CMD_CLEAN as usize, wide("Clean up").as_ptr());
         let sleep_lbl = if st.asleep { "Wake up" } else { "Lights out" };
@@ -652,6 +653,7 @@ fn show_menu(hwnd: HWND) {
 fn retire(a: &mut App) {
     let t = now();
     let enshrined = a.game.pet.enshrine(t);
+    a.game.rivals = Pet::rivals();
     let ev = a.game.retire(enshrined, t);
     a.handle(ev);
 }
@@ -920,6 +922,7 @@ fn main() {
         };
         let mut game = Game::new(pet, now());
         game.news = warning.unwrap_or_default();
+        game.rivals = Pet::rivals();
         let mut app = App {
             game,
             hwnd,

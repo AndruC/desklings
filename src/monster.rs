@@ -396,7 +396,10 @@ pub fn paths(sp: Species) -> String {
         Galewing | Mystifur => champion("Seraphox"),
         Bulwark | Tidecrest => champion("Titanshell"),
         Grumbloo => "A dead end... but a happy one. Start over to try another path.".into(),
-        Infernax | Seraphox | Titanshell => "Fully evolved. Keep training and climb to Rank S!".into(),
+        Infernax | Seraphox | Titanshell => format!(
+            "Fully evolved. Keep training and climb the ranks: past Rank S lies the Master league, up to {}.              From Rank S on, the last win of every rank is a title match against its champion.              Monsters from your Hall of Fame may come back for a rematch once you reach their league.",
+            RANKS[RANKS.len() - 1]
+        ),
     }
 }
 
@@ -491,10 +494,35 @@ pub fn train(drill: Drill, sp: Species, stats: &mut Stats, happy: f32, elderly: 
     (outcome, gm, gs)
 }
 
-pub const RANKS: [&str; 6] = ["E", "D", "C", "B", "A", "S"];
+pub const RANKS: [&str; 11] = ["E", "D", "C", "B", "A", "S", "Master I", "Master II", "Master III", "Master IV", "Master V"];
 pub const WINS_TO_RANK_UP: u8 = 3;
+/// From Rank S on, the last win a rank needs has to be a title match against its champion.
+pub const RANK_S: usize = 5;
 /// Total stats of a typical opponent at each rank.
-const RANK_BUDGET: [u32; 6] = [60, 130, 230, 360, 520, 750];
+const RANK_BUDGET: [u32; 11] = [60, 130, 230, 360, 520, 750, 950, 1250, 1650, 2150, 2750];
+/// Chance (percent) that a battle is a rematch with a retired monster in your league, if there is one.
+pub const RIVAL_ODDS: u32 = 25;
+/// Retired monsters within this share (percent) of a rank's budget count as in its league.
+pub const RIVAL_LEAGUE: (u32, u32) = (80, 150);
+
+/// The champion guarding the way out of Rank S and each Master rank below the top. It fights
+/// with the next rank's budget: beating it shows you belong there.
+const TITLE_HOLDERS: [(Species, &str); 5] = [
+    (Species::Titanshell, "the Gatekeeper"),
+    (Species::Seraphox, "the Silver Sage"),
+    (Species::Infernax, "the Ash King"),
+    (Species::Titanshell, "the Living Island"),
+    (Species::Infernax, "the Undying Flame"),
+];
+
+pub fn rank_budget(rank: usize) -> u32 {
+    RANK_BUDGET[rank.min(RANKS.len() - 1)]
+}
+
+/// Who holds the title at `rank`, if winning out of it takes a title match.
+pub fn title_holder(rank: usize) -> Option<(Species, &'static str)> {
+    TITLE_HOLDERS.get(rank.checked_sub(RANK_S)?).copied()
+}
 
 pub struct Fighter {
     pub sp: Species,
@@ -523,11 +551,21 @@ pub fn opponent(rank: usize, rng: &mut Rng) -> Fighter {
         _ => &[Infernax, Seraphox, Titanshell],
     };
     let sp = pool[rng.below(pool.len() as u32) as usize];
+    shaped(sp, RANK_BUDGET[rank], rng)
+}
+
+/// The champion for a title match out of `rank`, or None if that rank has none.
+pub fn title_challenger(rank: usize, rng: &mut Rng) -> Option<(Fighter, &'static str)> {
+    let (sp, title) = title_holder(rank)?;
+    Some((shaped(sp, rank_budget(rank + 1), rng), title))
+}
+
+/// A `sp` with about `budget` total stats, spread the way its species grows.
+fn shaped(sp: Species, budget: u32, rng: &mut Rng) -> Fighter {
     let g = sp.info().growth;
     let weights: [f32; 5] = std::array::from_fn(|i| g[i] * (0.8 + rng.below(40) as f32 / 100.0));
     let sum: f32 = weights.iter().sum();
-    let budget = RANK_BUDGET[rank] as f32;
-    let stats = weights.map(|w| ((budget * w / sum).round() as u16).clamp(1, STAT_MAX));
+    let stats = weights.map(|w| ((budget as f32 * w / sum).round() as u16).clamp(1, STAT_MAX));
     Fighter::new(sp, stats)
 }
 
@@ -799,6 +837,22 @@ mod tests {
                 .count()
         };
         assert!(fails(0.0, &mut rng) > fails(100.0, &mut rng) + 300);
+    }
+
+    #[test]
+    fn every_rank_from_s_but_the_top_has_a_champion() {
+        assert_eq!(RANKS[RANK_S], "S");
+        for rank in 0..RANKS.len() {
+            let has = title_holder(rank).is_some();
+            assert_eq!(has, (RANK_S..RANKS.len() - 1).contains(&rank), "rank {}", RANKS[rank]);
+        }
+        let mut rng = Rng(8);
+        for rank in RANK_S..RANKS.len() - 1 {
+            let (champ, _) = title_challenger(rank, &mut rng).unwrap();
+            assert_eq!(champ.sp.info().stage, Stage::Ultimate);
+            let (t, next) = (total(&champ.stats), RANK_BUDGET[rank + 1]);
+            assert!(t.abs_diff(next) * 10 <= next, "Rank {} champion has {t}, next budget {next}", RANKS[rank]);
+        }
     }
 
     #[test]

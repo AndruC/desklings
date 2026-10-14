@@ -51,9 +51,20 @@ pub enum Event {
     Save,
 }
 
+/// Who it's up against.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Foe {
+    Wild,
+    /// The rank's champion, with its title ("the Gatekeeper"): win to move up.
+    Title(&'static str),
+    /// A retired monster of this generation, back for a rematch.
+    Rival(u32),
+}
+
 pub struct Battle {
     pub me: Fighter,
     pub foe: Fighter,
+    pub kind: Foe,
     pub my_turn: bool,
     step_t: u32,
     pub turns: u32,
@@ -69,6 +80,7 @@ impl Battle {
             my_turn: strikes_first(&me, &foe),
             me,
             foe,
+            kind: Foe::Wild,
             step_t: 6,
             turns: 0,
             result: None,
@@ -111,6 +123,8 @@ pub struct Game {
     pub news: String, // last training / battle result, shown in the menu
     pub retiring: bool,
     pub evo_flash: u32,
+    /// Retired monsters that may come back for a rematch; the shell fills this from the Hall of Fame.
+    pub rivals: Vec<Rival>,
     dozed_while_away: bool, // it nodded off because you left; it wakes when you're back
     rng: Rng,
 }
@@ -126,6 +140,7 @@ impl Game {
             news: String::new(),
             retiring: false,
             evo_flash: 0,
+            rivals: Vec::new(),
             dozed_while_away: false,
             rng: Rng(seed | 1),
         };
@@ -440,11 +455,49 @@ impl Game {
         self.overwork_check();
         self.pet.energy -= 20.0;
         self.pet.full = (self.pet.full - 8.0).max(0.0);
-        let foe = opponent(self.pet.rank as usize, &mut self.rng);
+        let rank = self.pet.rank as usize;
+        let (foe, kind) = if self.title_due() {
+            let (champ, title) = title_challenger(rank, &mut self.rng).expect("title_due checked");
+            self.news = format!("Title match! {} {title} guards the way to Rank {}.", champ.sp.info().name, RANKS[rank + 1]);
+            (champ, Foe::Title(title))
+        } else if let Some(r) = self.pick_rival() {
+            self.news = format!("Gen {} {} is back from the Hall of Fame for a rematch!", r.generation, r.species.info().name);
+            (Fighter::new(r.species, r.stats), Foe::Rival(r.generation))
+        } else {
+            (opponent(rank, &mut self.rng), Foe::Wild)
+        };
         let me = Fighter::new(self.pet.species, self.pet.stats);
-        self.battle = Some(Battle::new(me, foe));
+        let mut battle = Battle::new(me, foe);
+        battle.kind = kind;
+        self.battle = Some(battle);
         self.set_act(Act::Battle, 0);
         ev.push(Event::BattleStarted);
+    }
+
+    /// The next battle is a title match: one more win would promote it out of a rank that has a
+    /// champion. Until it beats the champion, every battle at that rank is the title match.
+    pub fn title_due(&self) -> bool {
+        self.pet.rank_wins + 1 >= WINS_TO_RANK_UP && title_holder(self.pet.rank as usize).is_some()
+    }
+
+    /// Sometimes a retired monster about as strong as this rank's wild ones comes back to fight.
+    fn pick_rival(&mut self) -> Option<Rival> {
+        let budget = rank_budget(self.pet.rank as usize);
+        let (lo, hi) = (budget * RIVAL_LEAGUE.0 / 100, budget * RIVAL_LEAGUE.1 / 100);
+        let fit: Vec<Rival> = self.rivals.iter().filter(|r| (lo..=hi).contains(&total(&r.stats))).copied().collect();
+        if fit.is_empty() || self.rng.below(100) >= RIVAL_ODDS {
+            return None;
+        }
+        Some(fit[self.rng.below(fit.len() as u32) as usize])
+    }
+
+    /// The Battle menu item.
+    pub fn battle_label(&self) -> String {
+        if self.title_due() {
+            format!("Battle: title match for Rank {}", RANKS[self.pet.rank as usize + 1])
+        } else {
+            format!("Battle (Rank {})", RANKS[self.pet.rank as usize])
+        }
     }
 
     /// Every animation frame during a battle. Blows only start once the opponent has walked up.
@@ -475,16 +528,22 @@ impl Game {
     fn finish_battle(&mut self, won: bool, ev: &mut Vec<Event>) {
         let Some(b) = self.battle.take() else { return };
         ev.push(Event::BattleOver);
-        let foe = b.foe.sp.info().name;
+        let name = b.foe.sp.info().name;
+        let foe = match b.kind {
+            Foe::Wild => format!("a wild {name}"),
+            Foe::Title(title) => format!("{name} {title}"),
+            Foe::Rival(generation) => format!("Gen {generation} {name}"),
+        };
         let rank = RANKS[self.pet.rank as usize];
         let promoted = self.pet.record_battle(won);
         if won {
-            self.news = format!("Beat a wild {foe} (Rank {rank})!");
-            // A small bonus to a stat that still has room to grow.
+            self.news = format!("Beat {foe} (Rank {rank})!");
+            // A bonus to a stat that still has room to grow; bigger for a champion or a rival.
+            let bonus = if b.kind == Foe::Wild { 2 } else { 5 };
             let open: Vec<usize> = (0..5).filter(|&i| self.pet.stats[i] < STAT_MAX).collect();
             if !open.is_empty() {
                 let i = open[self.rng.below(open.len() as u32) as usize];
-                let gain = add(&mut self.pet.stats, i, 2);
+                let gain = add(&mut self.pet.stats, i, bonus);
                 self.news += &format!(" {} +{gain}", STAT_NAMES[i]);
             }
             if let Some(r) = promoted {
@@ -493,7 +552,7 @@ impl Game {
             self.set_act(Act::Show(STAR), 25);
             ev.push(Event::Hop(12.0));
         } else {
-            self.news = format!("Lost to a wild {foe} (Rank {rank}). Train up and try again!");
+            self.news = format!("Lost to {foe} (Rank {rank}). Train up and try again!");
             self.set_act(Act::Show(SWEAT), 25);
         }
         ev.push(Event::Save);
@@ -563,6 +622,8 @@ impl Game {
         if p.stage() != Stage::Egg {
             let progress = if p.rank as usize == RANKS.len() - 1 {
                 "top rank".to_string()
+            } else if self.title_due() {
+                "title match next".to_string()
             } else {
                 format!("{}/{} to next", p.rank_wins, WINS_TO_RANK_UP)
             };
@@ -590,6 +651,28 @@ impl Game {
         lines
     }
 
+    /// What it takes to move up from its current rank.
+    fn rank_text(&self) -> String {
+        let p = &self.pet;
+        let rank = p.rank as usize;
+        if rank == RANKS.len() - 1 {
+            return "It's at the top of the Master league.".into();
+        }
+        let next = RANKS[rank + 1];
+        let wins = |n: u8| format!("{n} more win{}", if n == 1 { "" } else { "s" });
+        match title_holder(rank) {
+            Some((sp, title)) if self.title_due() => {
+                format!("Next battle: a title match against {} {title}. Win it to reach Rank {next}.", sp.info().name)
+            }
+            Some((sp, title)) => format!(
+                "{} here, then a title match against {} {title} for Rank {next}.",
+                wins(WINS_TO_RANK_UP - 1 - p.rank_wins),
+                sp.info().name
+            ),
+            None => format!("{} to reach Rank {next}.", wins(WINS_TO_RANK_UP - p.rank_wins)),
+        }
+    }
+
     pub fn guide(&self, now: u64) -> String {
         let p = &self.pet;
         let info = p.species.info();
@@ -607,7 +690,7 @@ impl Game {
         let stats: Vec<String> = (0..5).map(|i| format!("{} {}", STAT_NAMES[i], p.stats[i])).collect();
         let raised: Vec<&str> = ALL_SPECIES[1..].iter().filter(|s| p.seen & s.bit() != 0).map(|s| s.info().name).collect();
         format!(
-            "{} — {} · Generation {}\n\"{}\"\n\n{}\n{}\n\n{}\n\nStats: {} (total {})\nCare mistakes: {} · Battles: {} won, {} lost · Rank {}\n\n\
+            "{} — {} · Generation {}\n\"{}\"\n\n{}\n{}\n\n{}\n\nStats: {} (total {})\nCare mistakes: {} · Battles: {} won, {} lost · Rank {}\n{}\n\n\
              Monsters raised ({}/{}): {}",
             info.name,
             info.stage.name(),
@@ -622,6 +705,7 @@ impl Game {
             p.wins,
             p.losses,
             RANKS[p.rank as usize],
+            self.rank_text(),
             raised.len(),
             ALL_SPECIES.len() - 1,
             if raised.is_empty() { "none yet".to_string() } else { raised.join(", ") },
@@ -1012,6 +1096,105 @@ mod tests {
         let second_wins = (0..2000).filter(|_| duel(slower(), twin(), &mut rng)).count();
         let sum = first_wins + second_wins;
         assert!((1800..=2200).contains(&sum), "first {first_wins} + second {second_wins} should be ~2000");
+    }
+
+    /// Starts a battle and fights it to the end; returns who it was against.
+    fn fight(g: &mut Game) -> Foe {
+        g.pet.energy = 100.0;
+        g.act = Act::Idle;
+        g.command(CMD_BATTLE, NOW);
+        let kind = g.battle.as_ref().expect("battle started").kind;
+        run(g, 300, |g| g.battle.is_none());
+        assert!(g.battle.is_none(), "battle never ended");
+        kind
+    }
+
+    #[test]
+    fn rank_s_and_up_end_with_a_title_match() {
+        let mut g = game(Species::Infernax);
+        g.pet.stats = [STAT_MAX; 5];
+        g.pet.rank = RANK_S as u8;
+        assert!(!g.title_due());
+        assert_eq!(fight(&mut g), Foe::Wild);
+        assert_eq!(fight(&mut g), Foe::Wild);
+        assert!(g.title_due() && g.battle_label().contains("title match for Rank Master I"), "{}", g.battle_label());
+        assert!(g.status_lines(NOW, false)[1].contains("title match next"));
+        assert!(g.guide(NOW).contains("Next battle: a title match against Titanshell the Gatekeeper"));
+        assert_eq!(fight(&mut g), Foe::Title("the Gatekeeper"));
+        assert_eq!(RANKS[g.pet.rank as usize], "Master I", "news: {}", g.news);
+        assert!(g.news.contains("Promoted to Rank Master I"), "{}", g.news);
+        assert!(g.guide(NOW).contains("2 more wins here, then a title match against Seraphox the Silver Sage"));
+
+        // All the way up: the top rank has no champion and no more promotions.
+        while (g.pet.rank as usize) < RANKS.len() - 1 {
+            fight(&mut g);
+        }
+        assert_eq!(g.pet.rank as usize, RANKS.len() - 1);
+        for _ in 0..3 {
+            assert_eq!(fight(&mut g), Foe::Wild);
+        }
+        assert!(!g.title_due() && g.guide(NOW).contains("top of the Master league"));
+    }
+
+    #[test]
+    fn losing_a_title_match_means_trying_it_again() {
+        let mut g = game(Species::Infernax);
+        g.pet.stats = [100; 5]; // far too weak for a 1000-stat champion
+        g.pet.rank = RANK_S as u8;
+        g.pet.rank_wins = WINS_TO_RANK_UP - 1;
+        assert_eq!(fight(&mut g), Foe::Title("the Gatekeeper"));
+        assert_eq!((g.pet.losses, g.pet.rank as usize, g.pet.rank_wins), (1, RANK_S, WINS_TO_RANK_UP - 1));
+        assert!(g.news.starts_with("Lost to Titanshell the Gatekeeper"), "{}", g.news);
+        assert_eq!(fight(&mut g), Foe::Title("the Gatekeeper"), "the champion is still waiting");
+    }
+
+    #[test]
+    fn below_rank_s_there_are_no_title_matches() {
+        let mut g = game(Species::Pyrorex);
+        g.pet.stats = [300; 5];
+        g.pet.rank = RANK_S as u8 - 1;
+        g.pet.rank_wins = WINS_TO_RANK_UP - 1;
+        assert_eq!(fight(&mut g), Foe::Wild);
+        assert_eq!(RANKS[g.pet.rank as usize], "S");
+    }
+
+    #[test]
+    fn retirees_in_your_league_come_back_for_rematches() {
+        let rival = |generation, v| Rival { generation, species: Species::Seraphox, stats: [v; 5] };
+        let mut g = game(Species::Infernax);
+        g.pet.stats = [STAT_MAX; 5];
+        g.pet.rank = (RANKS.len() - 1) as u8; // top rank: no title matches in the way
+        let budget = rank_budget(g.pet.rank as usize) / 5;
+        // One about this rank's strength, one far too weak to bother.
+        g.rivals = vec![rival(1, 20), rival(3, budget as u16)];
+        let mut rematches = 0;
+        for _ in 0..80 {
+            g.pet.stats = [900; 5]; // strong enough to win, with room for the bonus
+            match fight(&mut g) {
+                Foe::Rival(generation) => {
+                    assert_eq!(generation, 3, "a Gen 1 with 100 total stats isn't in Master V's league");
+                    assert!(g.news.starts_with("Beat Gen 3 Seraphox") && g.news.contains("+5"), "{}", g.news);
+                    rematches += 1;
+                }
+                Foe::Wild => {}
+                Foe::Title(_) => panic!("no champion at the top"),
+            }
+        }
+        assert!((8..=35).contains(&rematches), "{rematches}/80 rematches, expected about {RIVAL_ODDS}%");
+
+        // No Hall of Fame: never a rematch.
+        g.rivals.clear();
+        assert!((0..20).all(|_| fight(&mut g) == Foe::Wild));
+    }
+
+    #[test]
+    fn a_title_match_beats_a_rematch() {
+        let mut g = game(Species::Infernax);
+        g.pet.stats = [STAT_MAX; 5];
+        g.pet.rank = RANK_S as u8;
+        g.pet.rank_wins = WINS_TO_RANK_UP - 1;
+        g.rivals = vec![Rival { generation: 1, species: Species::Raptin, stats: [150; 5] }; 50];
+        assert_eq!(fight(&mut g), Foe::Title("the Gatekeeper"));
     }
 
     #[test]

@@ -322,6 +322,15 @@ impl Pet {
         text.lines().rev().take(limit).map(shown).collect()
     }
 
+    /// Every retired monster that can still come back for a rematch, oldest first.
+    pub fn rivals() -> Vec<Rival> {
+        Pet::dir().map(|d| Pet::rivals_in(&d)).unwrap_or_default()
+    }
+
+    fn rivals_in(dir: &std::path::Path) -> Vec<Rival> {
+        read_text(&dir.join(HALL_FILE)).unwrap_or_default().lines().filter_map(Rival::parse).collect()
+    }
+
     /// Writes the save to a temp file, flushes it to disk, then swaps it in, so a crash or power
     /// cut leaves either the old save or the new one. Returns false if it couldn't save.
     pub fn save(&self, x: f32) -> bool {
@@ -565,6 +574,29 @@ impl Pet {
                 Loaded::Damaged(Pet::new_at(seen, now), note)
             }
         }
+    }
+}
+
+/// A retired monster from the Hall of Fame, as strong as it was when it retired.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Rival {
+    pub generation: u32,
+    pub species: Species,
+    pub stats: Stats,
+}
+
+impl Rival {
+    /// Reads one Hall of Fame line, as `enshrine` writes it:
+    /// `Gen 2 · Pyrorex (Champion) · ... · stats 1/2/3/4/5 (total 15) #123`. Lines it can't make
+    /// sense of (older formats, hand edits) are skipped rather than treated as damage.
+    pub fn parse(line: &str) -> Option<Rival> {
+        let mut parts = line.split(" · ");
+        let generation = parts.next()?.strip_prefix("Gen ")?.parse().ok()?;
+        let species = Species::from_name(parts.next()?.split(" (").next()?)?;
+        let stats = parts.find_map(|p| p.strip_prefix("stats "))?.split(' ').next()?;
+        let stats: Vec<u16> = stats.split('/').map(|n| n.parse().ok()).collect::<Option<_>>()?;
+        let stats: Stats = stats.try_into().ok()?;
+        Some(Rival { generation, species, stats: stats.map(|v| v.min(STAT_MAX)) })
     }
 }
 
@@ -946,6 +978,33 @@ saved={NOW}
         let hall = Pet::hall_of_fame_in(&dir, 10);
         assert_eq!(hall.len(), 1, "...but writes nothing new");
         assert!(hall[0].starts_with("Gen 4 · Mystifur") && !hall[0].contains('#'), "{}", hall[0]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn retirees_come_back_as_rivals() {
+        let dir = temp_dir("rivals");
+        assert!(Pet::rivals_in(&dir).is_empty(), "no Hall of Fame yet");
+        let mut p = sample();
+        p.rank = 8; // "Rank Master III": a multi-word rank mustn't confuse the reader
+        assert!(p.enshrine_in(&dir, NOW));
+        let mut q = sample();
+        q.born += 1;
+        q.species = Species::Infernax;
+        q.generation = 5;
+        q.stats = [999, 800, 700, 600, 500];
+        assert!(q.enshrine_in(&dir, NOW));
+        let path = dir.join(HALL_FILE);
+        let mut text = std::fs::read_to_string(&path).unwrap();
+        text += "a line someone typed in
+Gen 9 · Nobodymon (Rookie) · stats 1/2/3/4/5 (total 15) #1
+";
+        std::fs::write(&path, text).unwrap();
+        let rivals = Pet::rivals_in(&dir);
+        assert_eq!(rivals, vec![
+            Rival { generation: 4, species: Species::Mystifur, stats: [70, 50, 60, 90, 140] },
+            Rival { generation: 5, species: Species::Infernax, stats: [999, 800, 700, 600, 500] },
+        ]);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
