@@ -19,7 +19,7 @@ pub const AWAY_FLOOR: f32 = 15.0;
 pub const MEAL_SECS: u64 = 600;
 pub const MEAL_FULL: f32 = 40.0; // over a whole meal; it stops eating once it's full
 pub const PLAY_SECS: u64 = 300;
-pub const PLAY_HAPPY: f32 = 25.0; // over a whole session; it stops once it's as happy as can be
+pub const PLAY_HAPPY: f32 = 40.0; // over a whole session; it stops once it's as happy as can be
 pub const PLAY_ENERGY: f32 = 8.0;
 pub const PLAY_FULL: f32 = 5.0;
 
