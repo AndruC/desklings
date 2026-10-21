@@ -2,12 +2,12 @@
 
 use crate::sprites::*;
 
-pub const LIFE: usize = 0;
+pub const STA: usize = 0;
 pub const POW: usize = 1;
 pub const DEF: usize = 2;
 pub const SPD: usize = 3;
 pub const WIS: usize = 4;
-pub const STAT_NAMES: [&str; 5] = ["Life", "Power", "Defense", "Speed", "Wisdom"];
+pub const STAT_NAMES: [&str; 5] = ["Stamina", "Power", "Defense", "Speed", "Wisdom"];
 pub const STAT_MAX: u16 = 999;
 pub type Stats = [u16; 5];
 
@@ -120,7 +120,7 @@ pub struct Info {
     pub stage: Stage,
     pub frames: &'static [Sprite],
     pub pal: Pal,
-    /// Training/evolution multipliers for Life, Power, Defense, Speed, Wisdom.
+    /// Training/evolution multipliers for Stamina, Power, Defense, Speed, Wisdom.
     pub growth: [f32; 5],
     pub blurb: &'static str,
 }
@@ -327,7 +327,7 @@ pub fn evolution(sp: Species, s: &Stats, mistakes: u32, wins: u32) -> Option<Spe
         Blop => {
             let power = s[POW];
             let agile = s[SPD].max(s[WIS]);
-            let sturdy = s[DEF].max(s[LIFE]);
+            let sturdy = s[DEF].max(s[STA]);
             if power >= agile && power >= sturdy {
                 Raptin
             } else if agile >= sturdy {
@@ -339,7 +339,7 @@ pub fn evolution(sp: Species, s: &Stats, mistakes: u32, wins: u32) -> Option<Spe
         Raptin | Fluffin | Shellby if mistakes >= CHAMPION_DUD_MISTAKES || t < CHAMPION_MIN_TOTAL => Grumbloo,
         Raptin => if s[POW] >= s[DEF] { Pyrorex } else { Cragdon },
         Fluffin => if s[SPD] >= s[WIS] { Galewing } else { Mystifur },
-        Shellby => if s[DEF] >= s[LIFE] { Bulwark } else { Tidecrest },
+        Shellby => if s[DEF] >= s[STA] { Bulwark } else { Tidecrest },
         Pyrorex | Cragdon | Galewing | Mystifur | Bulwark | Tidecrest => {
             if mistakes > ULTIMATE_MAX_MISTAKES || wins < ULTIMATE_MIN_WINS || t < ULTIMATE_MIN_TOTAL {
                 return None;
@@ -386,12 +386,12 @@ pub fn paths(sp: Species) -> String {
         Blip => "Grows into Blop.".into(),
         Blop => format!(
             "After {} as In-Training, becomes a Rookie based on its best stat (a tie goes to the one listed first):\n  \
-             • Power → Raptin\n  • Speed or Wisdom → Fluffin\n  • Defense or Life → Shellby",
+             • Power → Raptin\n  • Speed or Wisdom → Fluffin\n  • Defense or Stamina → Shellby",
             stage_time(Stage::InTraining)
         ),
         Raptin => rookie("Pyrorex", "Cragdon", "Power", "Defense"),
         Fluffin => rookie("Galewing", "Mystifur", "Speed", "Wisdom"),
-        Shellby => rookie("Bulwark", "Tidecrest", "Defense", "Life"),
+        Shellby => rookie("Bulwark", "Tidecrest", "Defense", "Stamina"),
         Pyrorex | Cragdon => champion("Infernax"),
         Galewing | Mystifur => champion("Seraphox"),
         Bulwark | Tidecrest => champion("Titanshell"),
@@ -426,11 +426,11 @@ impl Drill {
 
     pub fn label(self) -> &'static str {
         match self {
-            Drill::Run => "Run\tSpeed, Life",
+            Drill::Run => "Run\tSpeed, Stamina",
             Drill::Lift => "Lift\tPower, Defense",
-            Drill::Endure => "Endure\tDefense, Life",
+            Drill::Endure => "Endure\tDefense, Stamina",
             Drill::Study => "Study\tWisdom, Speed",
-            Drill::Swim => "Swim\tLife, Power",
+            Drill::Swim => "Swim\tStamina, Power",
         }
     }
 
@@ -441,11 +441,11 @@ impl Drill {
     /// (main stat, side stat)
     pub fn stats(self) -> (usize, usize) {
         match self {
-            Drill::Run => (SPD, LIFE),
+            Drill::Run => (SPD, STA),
             Drill::Lift => (POW, DEF),
-            Drill::Endure => (DEF, LIFE),
+            Drill::Endure => (DEF, STA),
             Drill::Study => (WIS, SPD),
-            Drill::Swim => (LIFE, POW),
+            Drill::Swim => (STA, POW),
         }
     }
 
@@ -533,7 +533,7 @@ pub struct Fighter {
 
 impl Fighter {
     pub fn new(sp: Species, stats: Stats) -> Fighter {
-        let max_hp = 20 + stats[LIFE] as i32 * 2;
+        let max_hp = 20 + stats[STA] as i32 * 2;
         Fighter { sp, stats, hp: max_hp, max_hp }
     }
 }
@@ -686,7 +686,7 @@ mod tests {
     #[test]
     fn guide_names_the_tie_winner_and_real_durations() {
         use Species::*;
-        for (sp, hi, lo) in [(Raptin, POW, DEF), (Fluffin, SPD, WIS), (Shellby, DEF, LIFE)] {
+        for (sp, hi, lo) in [(Raptin, POW, DEF), (Fluffin, SPD, WIS), (Shellby, DEF, STA)] {
             let mut s = [60; 5];
             s[hi] = 80;
             s[lo] = 80;
@@ -760,8 +760,8 @@ mod tests {
     #[test]
     fn blop_guide_matches_its_tie_rules() {
         use Species::*;
-        // Listed order in the guide: Power, then Speed/Wisdom, then Defense/Life.
-        let order = [(POW, Raptin), (SPD, Fluffin), (WIS, Fluffin), (DEF, Shellby), (LIFE, Shellby)];
+        // Listed order in the guide: Power, then Speed/Wisdom, then Defense/Stamina.
+        let order = [(POW, Raptin), (SPD, Fluffin), (WIS, Fluffin), (DEF, Shellby), (STA, Shellby)];
         for (i, &(a, first)) in order.iter().enumerate() {
             for &(b, _) in &order[i + 1..] {
                 let mut s = [10; 5];

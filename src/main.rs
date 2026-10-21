@@ -489,7 +489,12 @@ impl App {
         let g = &self.game;
         let info = g.pet.species.info();
         let asleep = g.pet.asleep;
-        let moving = !asleep && matches!(g.act, Act::Walk | Act::Joy | Act::Eat | Act::Train(_));
+        // A long meal or game keeps the calm idle pace; quick reactions bounce.
+        let moving = !asleep && match g.act {
+            Act::Joy | Act::Eat => g.care.is_none(),
+            Act::Walk | Act::Train(_) => true,
+            _ => false,
+        };
         let airborne = self.vy != 0.0 || self.held.is_some();
         let beat = if asleep { (f / 15) % 2 } else if moving { (f / 3) % 2 } else { (f / 8) % 2 };
 

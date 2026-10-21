@@ -15,8 +15,8 @@ The exe isn't code-signed, so Windows SmartScreen may warn you the first time. C
 ## Features
 
 - **Lives on your taskbar.** Always on top. Clicks pass through the transparent parts, and it never steals focus from your work: after the right-click menu closes, focus goes back to where it was. Drag it anywhere, even to another monitor, and it drops back down. Pixel art is scaled in whole pixels to your main display's DPI, so it stays crisp there (a second monitor with a different scale setting may show it slightly soft).
-- **Needs:** hunger, happiness and energy. It poops a few minutes after eating, and the poop stays where it was dropped. Click a poop to clean it up.
-- **Stats:** Life, Power, Defense, Speed and Wisdom, each up to 999.
+- **Needs:** hunger, happiness and energy. Feeding and playing take time: a meal lasts up to 10 minutes and a game up to 5, and what they give trickles in as they go, so there's no doubling up. Training, battling or lights out cut them short, keeping what it's had so far. It poops a few minutes after eating, and the poop stays where it was dropped. Click a poop to clean it up.
+- **Stats:** Stamina, Power, Defense, Speed and Wisdom, each up to 999.
 - **Training:** five drills (Run, Lift, Endure, Study, Swim). Happy monsters train better, unhappy ones slack off, and sometimes you get a *Great!* session.
 - **Battles:** a wild monster walks up and the two auto-battle with HP bars. Win three at a rank to climb E→S, then on through the Master league (Master I–V). From Rank S on, the third win of each rank has to be a title match against that rank's champion, who fights at the next rank's strength.
 - **Rivals:** monsters from your Hall of Fame come back for a rematch (about one battle in four) once you reach a rank whose wild monsters are about as strong as they were. They wear their true colours, unlike wild monsters, and beating a champion or a rival earns a bigger stat bonus.
@@ -27,12 +27,12 @@ The exe isn't code-signed, so Windows SmartScreen may warn you the first time. C
 ## Evolution tree
 
 ```
-Egg → Blip → Blop ─┬─ Raptin  (Power)          ─┬─ Pyrorex   (Power ≥ Defense)  ─┐
-                   │                            └─ Cragdon   (Defense > Power)  ─┴─ Infernax
-                   ├─ Fluffin (Speed / Wisdom)  ─┬─ Galewing  (Speed ≥ Wisdom)  ─┐
-                   │                            └─ Mystifur  (Wisdom > Speed)   ─┴─ Seraphox
-                   └─ Shellby (Defense / Life)  ─┬─ Bulwark   (Defense ≥ Life)  ─┐
-                                                └─ Tidecrest (Life > Defense)   ─┴─ Titanshell
+Egg → Blip → Blop ─┬─ Raptin  (Power)              ─┬─ Pyrorex   (Power ≥ Defense)    ─┐
+                   │                                └─ Cragdon   (Defense > Power)    ─┴─ Infernax
+                   ├─ Fluffin (Speed / Wisdom)     ─┬─ Galewing  (Speed ≥ Wisdom)     ─┐
+                   │                                └─ Mystifur  (Wisdom > Speed)     ─┴─ Seraphox
+                   └─ Shellby (Defense / Stamina)  ─┬─ Bulwark   (Defense ≥ Stamina)  ─┐
+                                                    └─ Tidecrest (Stamina > Defense)  ─┴─ Titanshell
 
 Any Rookie with 5+ care mistakes or under 150 total stats → Grumbloo
 ```

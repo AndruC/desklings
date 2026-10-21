@@ -15,6 +15,37 @@ pub const MIN_NAP: u64 = 600; // once asleep it sleeps at least this long, even 
 /// While you're away (app closed or just not at the computer) needs never drift below this.
 pub const AWAY_FLOOR: f32 = 15.0;
 
+// Feeding and playing take a while: what they give (and cost) trickles in over the session.
+pub const MEAL_SECS: u64 = 600;
+pub const MEAL_FULL: f32 = 40.0; // over a whole meal; it stops eating once it's full
+pub const PLAY_SECS: u64 = 300;
+pub const PLAY_HAPPY: f32 = 25.0; // over a whole session; it stops once it's as happy as can be
+pub const PLAY_ENERGY: f32 = 8.0;
+pub const PLAY_FULL: f32 = 5.0;
+
+/// A meal or a play session.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Care {
+    Meal,
+    Play,
+}
+
+impl Care {
+    pub fn secs(self) -> u64 {
+        match self {
+            Care::Meal => MEAL_SECS,
+            Care::Play => PLAY_SECS,
+        }
+    }
+
+    pub fn doing(self) -> &'static str {
+        match self {
+            Care::Meal => "Eating",
+            Care::Play => "Playing",
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Sleep {
     Unchanged,
@@ -207,6 +238,26 @@ impl Pet {
             self.sulking = false;
         }
         change
+    }
+
+    /// `secs` seconds of a meal or play session. Returns whether there's still anything to gain
+    /// (it isn't full, or isn't as happy as can be, yet).
+    pub fn tend(&mut self, care: Care, secs: u64) -> bool {
+        let per_sec = |whole: f32| whole / care.secs() as f32;
+        match care {
+            Care::Meal => {
+                self.full = (self.full + secs as f32 * per_sec(MEAL_FULL)).min(100.0);
+                self.full < 100.0
+            }
+            Care::Play => {
+                // Only the seconds it takes to top up happiness cost anything.
+                let n = (secs as f32).min(((100.0 - self.happy) / per_sec(PLAY_HAPPY)).ceil());
+                self.happy = (self.happy + n * per_sec(PLAY_HAPPY)).min(100.0);
+                self.energy = (self.energy - n * per_sec(PLAY_ENERGY)).max(0.0);
+                self.full = (self.full - n * per_sec(PLAY_FULL)).max(0.0);
+                self.happy < 100.0
+            }
+        }
     }
 
     /// Books a battle result. Returns the new rank if this win earned a promotion.

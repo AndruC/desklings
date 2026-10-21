@@ -120,6 +120,8 @@ pub struct Game {
     pub act_t: u32,
     pub dir: i32,
     pub battle: Option<Battle>,
+    /// A meal or play session in progress, and the seconds it has left.
+    pub care: Option<(Care, u64)>,
     pub news: String, // last training / battle result, shown in the menu
     pub retiring: bool,
     pub evo_flash: u32,
@@ -137,6 +139,7 @@ impl Game {
             act_t: 20,
             dir: -1,
             battle: None,
+            care: None,
             news: String::new(),
             retiring: false,
             evo_flash: 0,
@@ -176,7 +179,9 @@ impl Game {
         let scene = self.in_scene();
         let free = !p.asleep && p.stage() != Stage::Egg && !scene;
         match cmd {
-            CMD_FEED | CMD_PLAY => free,
+            // Another of the same is greyed out until it's done; switching to the other ends it.
+            CMD_FEED => free && !matches!(self.care, Some((Care::Meal, _))),
+            CMD_PLAY => free && !matches!(self.care, Some((Care::Play, _))),
             CMD_TRAIN..=CMD_LAST => free,
             CMD_BATTLE => free && p.stage() >= Stage::InTraining,
             CMD_CLEAN => !p.poops.is_empty() && !scene,
@@ -196,6 +201,7 @@ impl Game {
     pub fn advance(&mut self, last: u64, now: u64, standing: bool, away: bool) -> Vec<Event> {
         let gap = now.saturating_sub(last);
         if gap > CATCH_UP_LIMIT {
+            self.finish_care(); // it finished eating or playing while you were gone
             self.pet.catch_up(gap);
             self.pet.review_day(now); // credit the days away first...
             self.pet.welcome_back(last, now); // ...then see whether it still needed to wait
@@ -225,7 +231,7 @@ impl Game {
             self.retiring = true;
             ev.push(Event::Retire);
         }
-        let busy = self.battle.is_some() || self.training();
+        let busy = self.battle.is_some() || self.training() || self.care.is_some();
         if away && !busy && !self.pet.asleep && self.pet.stage() != Stage::Egg {
             self.pet.sleep_at(now);
             self.dozed_while_away = true;
@@ -239,6 +245,13 @@ impl Game {
             // Reactions don't tick while asleep, so drop any pending one or it sticks.
             Sleep::FellAsleep => self.set_act(Act::Idle, 20),
             Sleep::Unchanged => {}
+        }
+        if let Some((care, left)) = self.care {
+            let more = self.pet.tend(care, 1);
+            self.care = (more && left > 1).then_some((care, left - 1));
+            if care == Care::Play && self.rng.below(15) == 0 {
+                ev.push(Event::Hop(10.0));
+            }
         }
         let poop_due = self.pet.next_poop != 0 && now >= self.pet.next_poop;
         if poop_due && standing && !away && self.battle.is_none() {
@@ -305,6 +318,11 @@ impl Game {
         if self.pet.stage() == Stage::Egg {
             return self.set_act(Act::Idle, 50);
         }
+        match self.care {
+            Some((Care::Meal, _)) => return self.set_act(Act::Eat, 50),
+            Some((Care::Play, _)) => return self.set_act(Act::Joy, 50),
+            None => {}
+        }
         let p = &self.pet;
         let lazy = p.full < 20.0 || p.happy < 20.0 || p.energy < 25.0 || p.elderly_at(now);
         let idle_odds = if lazy { 75 } else { 40 };
@@ -335,18 +353,15 @@ impl Game {
                 if p.full > 90.0 {
                     p.happy = (p.happy - 5.0).max(0.0); // overfed
                 }
-                p.full = (p.full + 30.0).min(100.0);
                 if p.next_poop == 0 {
                     p.next_poop = now + 180 + self.rng.below(420) as u64;
                 }
-                self.set_act(Act::Eat, 20);
+                self.care = Some((Care::Meal, MEAL_SECS));
+                self.set_act(Act::Eat, 50);
             }
             CMD_PLAY => {
-                let p = &mut self.pet;
-                p.happy = (p.happy + 20.0).min(100.0);
-                p.energy = (p.energy - 8.0).max(0.0);
-                p.full = (p.full - 5.0).max(0.0);
-                self.set_act(Act::Joy, 25);
+                self.care = Some((Care::Play, PLAY_SECS));
+                self.set_act(Act::Joy, 50);
                 ev.push(Event::Hop(14.0));
             }
             CMD_BATTLE => {
@@ -360,6 +375,7 @@ impl Game {
                 self.set_act(Act::Joy, 10);
             }
             CMD_SLEEP => {
+                self.care = None; // lights out ends a meal or game early
                 if self.pet.asleep {
                     self.pet.asleep = false;
                 } else {
@@ -371,6 +387,7 @@ impl Game {
                 self.pet.poops.clear();
                 ev.push(Event::PoopsCleared);
                 self.pet = Pet::new_at(self.pet.seen, now);
+                self.care = None;
                 self.news.clear();
                 self.set_act(Act::Idle, 20);
             }
@@ -406,6 +423,7 @@ impl Game {
             self.news = "Too tired to train. Let it rest.".into();
             return self.set_act(Act::Show(SWEAT), 20);
         }
+        self.care = None; // a meal or game ends early, keeping what it's had so far
         self.overwork_check();
         self.pet.energy -= 12.0;
         self.pet.full = (self.pet.full - 6.0).max(0.0);
@@ -452,6 +470,7 @@ impl Game {
             self.news = "Too tired to battle. Let it rest.".into();
             return self.set_act(Act::Show(SWEAT), 20);
         }
+        self.care = None;
         self.overwork_check();
         self.pet.energy -= 20.0;
         self.pet.full = (self.pet.full - 8.0).max(0.0);
@@ -560,11 +579,19 @@ impl Game {
 
     // ------------------------------------------------------------------ endings
 
+    /// Books the rest of a meal or play session at once.
+    fn finish_care(&mut self) {
+        if let Some((care, left)) = self.care.take() {
+            self.pet.tend(care, left);
+        }
+    }
+
     /// The app is closing: settle anything in progress so it's saved fairly. A battle that's
     /// already decided is booked as decided; one still going counts as running away; a drill in
-    /// progress finishes early (its cost is already paid).
+    /// progress finishes early (its cost is already paid); a meal or game is finished.
     pub fn settle(&mut self, now: u64) -> Vec<Event> {
         let mut ev = Vec::new();
+        self.finish_care();
         match self.battle.as_ref().map(|b| b.result) {
             Some(Some(won)) => self.finish_battle(won, &mut ev),
             Some(None) => {
@@ -589,6 +616,7 @@ impl Game {
             ev.push(Event::BattleOver);
         }
         self.pet.poops.clear();
+        self.care = None;
         let name = self.pet.species.info().name;
         self.pet = self.pet.successor_at(now);
         self.news = format!("{name} retired. Generation {} begins!", self.pet.generation);
@@ -636,6 +664,9 @@ impl Game {
             lines.push(format!("Hunger\t{}", hearts(p.full)));
             lines.push(format!("Happy\t{}", hearts(p.happy)));
             lines.push(format!("Energy\t{}", hearts(p.energy)));
+            if let Some((care, left)) = self.care {
+                lines.push(format!("{}…\t{} left", care.doing(), duration(left)));
+            }
             lines.push(format!("Care mistakes\t{}", p.mistakes));
             let life = if p.elderly_at(now) { "Twilight years" } else { "Lifespan" };
             lines.push(format!("Gen {} · {life}\t~{} left", p.generation, duration(p.life_left_at(now))));
@@ -1205,5 +1236,114 @@ mod tests {
         let ev = g.second(NOW, true, false);
         assert!(!ev.contains(&Event::Poop));
         assert_eq!(g.pet.mistakes, 1);
+    }
+
+    #[test]
+    fn a_meal_takes_time_and_cant_be_doubled_up() {
+        let mut g = game(Species::Raptin);
+        g.pet.full = 30.0;
+        g.command(CMD_FEED, NOW);
+        assert_eq!(g.pet.full, 30.0, "nothing up front: it has to eat it");
+        assert!(!g.allowed(CMD_FEED) && g.allowed(CMD_PLAY) && g.allowed(CMD_TRAIN));
+        assert!(g.command(CMD_FEED, NOW).is_empty(), "a second helping is refused mid-meal");
+        assert!(g.status_lines(NOW, false).iter().any(|l| l.starts_with("Eating")));
+
+        let (secs, _) = run(&mut g, MEAL_SECS + 5, |g| g.care.is_none());
+        assert_eq!(secs, MEAL_SECS - 1, "the meal lasts its full length");
+        let expect = 30.0 + MEAL_FULL - MEAL_SECS as f32 * FULL_RATE;
+        assert!((g.pet.full - expect).abs() < 0.5, "full {} expected {expect}", g.pet.full);
+        assert!(g.allowed(CMD_FEED));
+    }
+
+    #[test]
+    fn it_stops_eating_once_full() {
+        let mut g = game(Species::Raptin);
+        g.pet.full = 85.0;
+        g.command(CMD_FEED, NOW);
+        let (secs, _) = run(&mut g, MEAL_SECS, |g| g.care.is_none());
+        assert!(secs < MEAL_SECS * 2 / 3, "done after {secs} s");
+        assert!(g.pet.full > 99.0);
+    }
+
+    #[test]
+    fn play_takes_time_and_costs_as_it_goes() {
+        let mut g = game(Species::Raptin);
+        g.pet.happy = 40.0;
+        g.command(CMD_PLAY, NOW);
+        assert_eq!(g.pet.happy, 40.0);
+        assert!(!g.allowed(CMD_PLAY) && g.allowed(CMD_FEED));
+
+        let (secs, ev) = run(&mut g, PLAY_SECS + 5, |g| g.care.is_none());
+        assert_eq!(secs, PLAY_SECS - 1);
+        let happy = 40.0 + PLAY_HAPPY - PLAY_SECS as f32 * HAPPY_RATE;
+        let energy = 100.0 - PLAY_ENERGY - PLAY_SECS as f32 * TIRE_RATE;
+        assert!((g.pet.happy - happy).abs() < 0.5, "happy {} expected {happy}", g.pet.happy);
+        assert!((g.pet.energy - energy).abs() < 0.5, "energy {} expected {energy}", g.pet.energy);
+        assert!(ev.iter().filter(|e| matches!(e, Event::Hop(_))).count() >= 3, "hops now and then");
+    }
+
+    #[test]
+    fn training_battling_or_lights_out_cut_a_session_short() {
+        let mut g = game(Species::Raptin);
+        g.pet.full = 30.0;
+        g.command(CMD_FEED, NOW);
+        run(&mut g, 120, |_| false);
+        let fed = g.pet.full;
+        assert!(fed > 34.0, "kept what it ate: {fed}");
+        g.command(CMD_TRAIN, NOW + 120);
+        assert!(g.care.is_none() && g.training());
+
+        let mut g = game(Species::Raptin);
+        g.command(CMD_FEED, NOW);
+        g.command(CMD_PLAY, NOW);
+        assert_eq!(g.care, Some((Care::Play, PLAY_SECS)), "switching ends the meal");
+        g.command(CMD_BATTLE, NOW);
+        assert!(g.care.is_none() && g.battle.is_some());
+
+        let mut g = game(Species::Raptin);
+        g.command(CMD_PLAY, NOW);
+        g.command(CMD_SLEEP, NOW);
+        assert!(g.care.is_none() && g.pet.asleep);
+    }
+
+    #[test]
+    fn it_finishes_eating_before_dozing_off_when_you_leave() {
+        let mut g = game(Species::Raptin);
+        g.pet.full = 30.0;
+        g.command(CMD_FEED, NOW);
+        for s in 0..MEAL_SECS {
+            g.second(NOW + s, true, true);
+            assert!(!g.pet.asleep, "dozed off mid-meal ({s} s in)");
+        }
+        assert!(g.care.is_none() && g.pet.full > 60.0, "full {}", g.pet.full);
+        g.second(NOW + MEAL_SECS, true, true);
+        assert!(g.pet.asleep, "then naps");
+    }
+
+    #[test]
+    fn quitting_or_a_long_gap_books_the_rest_of_a_session() {
+        let mut g = game(Species::Raptin);
+        g.pet.full = 20.0;
+        g.command(CMD_FEED, NOW);
+        g.settle(NOW);
+        assert!(g.care.is_none());
+        assert!((g.pet.full - (20.0 + MEAL_FULL)).abs() < 0.01, "full {}", g.pet.full);
+
+        let mut g = game(Species::Raptin);
+        g.pet.happy = 50.0;
+        g.command(CMD_PLAY, NOW);
+        g.advance(NOW, NOW + 600, true, false);
+        assert!(g.care.is_none());
+        assert!(g.pet.happy > 70.0 && g.pet.energy < 93.0, "happy {} energy {}", g.pet.happy, g.pet.energy);
+    }
+
+    #[test]
+    fn play_only_costs_while_there_is_happiness_to_gain() {
+        let mut p = Pet::new_at(0, NOW);
+        p.happy = 99.0;
+        p.energy = 50.0;
+        assert!(!p.tend(Care::Play, PLAY_SECS));
+        assert_eq!(p.happy, 100.0);
+        assert!(p.energy > 49.0, "only the few seconds it took cost energy: {}", p.energy);
     }
 }
