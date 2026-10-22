@@ -16,10 +16,12 @@ pub const MIN_NAP: u64 = 600; // once asleep it sleeps at least this long, even 
 pub const AWAY_FLOOR: f32 = 15.0;
 
 // Feeding and playing take a while: what they give (and cost) trickles in over the session.
-pub const MEAL_SECS: u64 = 600;
-pub const MEAL_FULL: f32 = 40.0; // over a whole meal; it stops eating once it's full
-pub const PLAY_SECS: u64 = 300;
-pub const PLAY_HAPPY: f32 = 40.0; // over a whole session; it stops once it's as happy as can be
+// Short and generous enough that keeping up takes under a quarter of each hour (see the
+// `upkeep_leaves_time_to_train` test), leaving most of it for training and battles.
+pub const MEAL_SECS: u64 = 300;
+pub const MEAL_FULL: f32 = 60.0; // over a whole meal; it stops eating once it's full
+pub const PLAY_SECS: u64 = 180;
+pub const PLAY_HAPPY: f32 = 50.0; // over a whole session; it stops once it's as happy as can be
 pub const PLAY_ENERGY: f32 = 8.0;
 pub const PLAY_FULL: f32 = 5.0;
 
@@ -1140,6 +1142,15 @@ Gen 9 · Nobodymon (Rookie) · stats 1/2/3/4/5 (total 15) #1
         assert!(old.elderly_at(NOW));
         let (_, _, de) = drop(&mut old);
         assert!(close(de, 1.5 * TIRE_RATE), "elderly tire faster");
+    }
+
+    #[test]
+    fn upkeep_leaves_time_to_train() {
+        // An awake hour with four drills: how long it spends eating and playing to keep level.
+        let plays = HAPPY_RATE * 3600.0 / PLAY_HAPPY;
+        let meals = (FULL_RATE * 3600.0 + 4.0 * 6.0 + plays * PLAY_FULL) / MEAL_FULL;
+        let busy = meals * MEAL_SECS as f32 + plays * PLAY_SECS as f32;
+        assert!(busy < 900.0, "{:.0} min of every hour spent on upkeep", busy / 60.0);
     }
 
     #[test]
