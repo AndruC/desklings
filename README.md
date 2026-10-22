@@ -43,7 +43,7 @@ Any Rookie with 5+ care mistakes or under 150 total stats → Grumbloo
 | In-Training | 10 minutes | Can battle from here |
 | Rookie | 1 hour | Branch chosen by its best stat |
 | Champion | 1 day | Branch chosen by stats; bad care → Grumbloo |
-| Ultimate | 2+ days | Needs 500+ total stats, 5+ wins, ≤ 3 care mistakes |
+| Ultimate | 3+ days | Needs 1000+ total stats, 5+ wins, ≤ 3 care mistakes |
 
 A **care mistake** is letting it starve, letting its happiness hit zero, or letting poop pile up past three.
 

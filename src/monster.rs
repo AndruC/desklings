@@ -65,7 +65,7 @@ impl Stage {
             Stage::Fresh => Some(600),
             Stage::InTraining => Some(3600),
             Stage::Rookie => Some(86_400),
-            Stage::Champion => Some(172_800),
+            Stage::Champion => Some(259_200),
             Stage::Ultimate => None,
         }
     }
@@ -312,7 +312,7 @@ impl Species {
 
 const CHAMPION_MIN_TOTAL: u32 = 150;
 const CHAMPION_DUD_MISTAKES: u32 = 5;
-const ULTIMATE_MIN_TOTAL: u32 = 500;
+const ULTIMATE_MIN_TOTAL: u32 = 1000; // about double what it has on arriving as a Champion
 const ULTIMATE_MIN_WINS: u32 = 5;
 const ULTIMATE_MAX_MISTAKES: u32 = 3;
 
@@ -814,11 +814,11 @@ mod tests {
 
     #[test]
     fn ultimate_needs_stats_wins_and_care() {
-        let big = [120; 5];
+        let big = [200; 5];
         assert_eq!(evolution(Species::Galewing, &big, 0, 5), Some(Species::Seraphox));
         assert_eq!(evolution(Species::Galewing, &big, 0, 4), None);
         assert_eq!(evolution(Species::Galewing, &big, 4, 5), None);
-        assert_eq!(evolution(Species::Galewing, &[90; 5], 0, 5), None);
+        assert_eq!(evolution(Species::Galewing, &[200, 200, 200, 200, 199], 0, 5), None);
         assert_eq!(evolution(Species::Grumbloo, &big, 0, 99), None);
     }
 
