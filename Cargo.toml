@@ -2,7 +2,7 @@
 name = "desklings"
 description = "A tiny monster-raising pet that lives on your Windows taskbar"
 license = "MIT"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2021"
 rust-version = "1.80"
 
