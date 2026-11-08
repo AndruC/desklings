@@ -391,8 +391,7 @@ impl App {
                     self.game.dir = -1;
                 }
             }
-            let ev = self.game.tick(t);
-            self.handle(ev);
+            self.game.tick(t);
             self.x = self.x.clamp(min_x, max_x);
         }
         self.render();
@@ -489,10 +488,10 @@ impl App {
         let g = &self.game;
         let info = g.pet.species.info();
         let asleep = g.pet.asleep;
-        // A long meal or game keeps the calm idle pace; quick reactions bounce.
+        // A long meal, game or drill keeps the calm idle pace; quick reactions bounce.
         let moving = !asleep && match g.act {
             Act::Joy | Act::Eat => g.care.is_none(),
-            Act::Walk | Act::Train(_) => true,
+            Act::Walk | Act::Train(Drill::Run) => true,
             _ => false,
         };
         let airborne = self.vy != 0.0 || self.held.is_some();
@@ -514,7 +513,7 @@ impl App {
             }
         }
         match g.act {
-            Act::Train(Drill::Endure) => dx += if f % 4 < 2 { 1 } else { -1 },
+            Act::Train(Drill::Endure) if f % 30 < 10 => dx += if f % 4 < 2 { 1 } else { -1 }, // strains in bursts
             Act::Train(Drill::Lift) => dy -= ((f / 5) % 2) as i32,
             _ => {}
         }

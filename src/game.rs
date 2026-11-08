@@ -21,6 +21,8 @@ pub const CMD_LAST: i32 = CMD_TRAIN + Drill::ALL.len() as i32 - 1;
 
 /// Gaps longer than this (PC asleep, clock jump) are handled as time away instead of replayed.
 pub const CATCH_UP_LIMIT: u64 = 120;
+/// Running a drill turns around this often.
+const LAP_SECS: u32 = 4;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Act {
@@ -117,7 +119,7 @@ impl Battle {
 pub struct Game {
     pub pet: Pet,
     pub act: Act,
-    pub act_t: u32,
+    pub act_t: u32, // animation frames left of what it's doing; seconds left, for a drill
     pub dir: i32,
     pub battle: Option<Battle>,
     /// A meal or play session in progress, and the seconds it has left.
@@ -184,7 +186,8 @@ impl Game {
             CMD_PLAY => free && !matches!(self.care, Some((Care::Play, _))),
             CMD_TRAIN..=CMD_LAST => free,
             CMD_BATTLE => free && p.stage() >= Stage::InTraining,
-            CMD_CLEAN => !p.poops.is_empty() && !scene,
+            // A drill takes a while, and it doesn't need you out of the way to clean up.
+            CMD_CLEAN => !p.poops.is_empty() && self.battle.is_none() && !self.retiring,
             CMD_SLEEP => p.stage() != Stage::Egg && !scene,
             CMD_RETIRE => !scene && p.stage() >= Stage::Rookie,
             CMD_RESET => !scene,
@@ -201,12 +204,17 @@ impl Game {
     pub fn advance(&mut self, last: u64, now: u64, standing: bool, away: bool) -> Vec<Event> {
         let gap = now.saturating_sub(last);
         if gap > CATCH_UP_LIMIT {
-            self.finish_care(); // it finished eating or playing while you were gone
+            let before = self.news.clone();
+            let mut ev = Vec::new();
+            // It finished what it was doing while you were gone.
+            self.finish_care();
+            if let Act::Train(d) = self.act {
+                self.finish_training(d, last, &mut ev);
+            }
             self.pet.catch_up(gap);
             self.pet.review_day(now); // credit the days away first...
             self.pet.welcome_back(last, now); // ...then see whether it still needed to wait
-            let before = self.news.clone();
-            let ev = self.second(now, standing, away);
+            ev.extend(self.second(now, standing, away));
             let happened = if self.news != before { std::mem::take(&mut self.news) } else { String::new() };
             self.greet();
             // Keep anything else that happened on return (e.g. it evolved) alongside the greeting.
@@ -227,7 +235,7 @@ impl Game {
             self.evolve(next, now, &mut ev);
         }
         self.pet.review_day(now);
-        if self.pet.life_left_at(now) == 0 && !self.retiring && self.battle.is_none() && standing {
+        if self.pet.life_left_at(now) == 0 && !self.retiring && self.battle.is_none() && !self.training() && standing {
             self.retiring = true;
             ev.push(Event::Retire);
         }
@@ -251,6 +259,14 @@ impl Game {
             self.care = (more && left > 1).then_some((care, left - 1));
             if care == Care::Play && self.rng.below(15) == 0 {
                 ev.push(Event::Hop(10.0));
+            }
+        }
+        if let Act::Train(d) = self.act {
+            self.act_t = self.act_t.saturating_sub(1);
+            if self.act_t == 0 {
+                self.finish_training(d, now, &mut ev);
+            } else if d == Drill::Run && self.act_t % LAP_SECS == 0 {
+                self.dir = -self.dir;
             }
         }
         let poop_due = self.pet.next_poop != 0 && now >= self.pet.next_poop;
@@ -295,23 +311,15 @@ impl Game {
     }
 
     /// Every animation frame (10 a second) while it isn't being held: counts down whatever it's
-    /// doing and decides what's next.
-    pub fn tick(&mut self, now: u64) -> Vec<Event> {
-        let mut ev = Vec::new();
-        if self.pet.asleep || self.act == Act::Battle {
-            return ev;
-        }
-        if self.act == Act::Train(Drill::Run) && self.act_t % 8 == 0 {
-            self.dir = -self.dir; // laps
+    /// doing and decides what's next. A drill runs on the clock instead, in `second`.
+    pub fn tick(&mut self, now: u64) {
+        if self.pet.asleep || self.act == Act::Battle || self.training() {
+            return;
         }
         self.act_t = self.act_t.saturating_sub(1);
         if self.act_t == 0 {
-            match self.act {
-                Act::Train(d) => self.finish_training(d, now, &mut ev),
-                _ => self.choose_next(now),
-            }
+            self.choose_next(now);
         }
-        ev
     }
 
     fn choose_next(&mut self, now: u64) {
@@ -372,7 +380,9 @@ impl Game {
                 self.pet.poops.clear();
                 ev.push(Event::PoopsCleared);
                 self.pet.happy = (self.pet.happy + 5.0).min(100.0);
-                self.set_act(Act::Joy, 10);
+                if !self.training() {
+                    self.set_act(Act::Joy, 10);
+                }
             }
             CMD_SLEEP => {
                 self.care = None; // lights out ends a meal or game early
@@ -427,7 +437,7 @@ impl Game {
         self.overwork_check();
         self.pet.energy -= 12.0;
         self.pet.full = (self.pet.full - 6.0).max(0.0);
-        self.set_act(Act::Train(d), 40);
+        self.set_act(Act::Train(d), TRAIN_SECS as u32);
     }
 
     /// Pushing a tired monster costs it some lifespan.
@@ -667,6 +677,9 @@ impl Game {
             if let Some((care, left)) = self.care {
                 lines.push(format!("{}…\t{} left", care.doing(), duration(left)));
             }
+            if let Act::Train(d) = self.act {
+                lines.push(format!("Training: {}…\t{} left", d.name(), duration(self.act_t as u64)));
+            }
             lines.push(format!("Care mistakes\t{}", p.mistakes));
             let life = if p.elderly_at(now) { "Twilight years" } else { "Lifespan" };
             lines.push(format!("Gen {} · {life}\t~{} left", p.generation, duration(p.life_left_at(now))));
@@ -797,7 +810,7 @@ mod tests {
                 if g.battle.is_some() {
                     seen.extend(g.battle_tick(true));
                 }
-                seen.extend(g.tick(NOW + s));
+                g.tick(NOW + s);
             }
             if done(g) {
                 return (s, seen);
@@ -850,7 +863,7 @@ mod tests {
         let before = total(&g.pet.stats);
         g.command(CMD_TRAIN, NOW);
         assert!(matches!(g.act, Act::Train(_)));
-        let (_, ev) = run(&mut g, 30, |g| g.pet.asleep);
+        let (_, ev) = run(&mut g, TRAIN_SECS + 30, |g| g.pet.asleep);
         assert!(g.pet.asleep, "should doze off afterwards");
         assert!(ev.contains(&Event::Save), "the session was finished and saved");
         assert!(total(&g.pet.stats) > before, "news: {}", g.news);
@@ -943,8 +956,76 @@ mod tests {
         g.command(CMD_TRAIN + 1, NOW);
         g.second(NOW, true, false);
         assert_eq!(g.pet.species, Species::Blop, "mustn't evolve mid-drill");
-        run(&mut g, 10, |g| g.pet.species != Species::Blop);
+        run(&mut g, TRAIN_SECS + 10, |g| g.pet.species != Species::Blop);
         assert_ne!(g.pet.species, Species::Blop, "evolves once the drill is done");
+    }
+
+    #[test]
+    fn a_drill_takes_its_full_time_and_cant_be_doubled_up() {
+        let mut g = game(Species::Raptin);
+        let before = total(&g.pet.stats);
+        g.command(CMD_TRAIN, NOW);
+        let energy = g.pet.energy;
+        assert!(!g.allowed(CMD_TRAIN) && !g.allowed(CMD_FEED) && !g.allowed(CMD_BATTLE));
+        assert!(g.command(CMD_TRAIN, NOW).is_empty());
+        assert_eq!(g.pet.energy, energy, "a second drill is refused, not charged");
+        assert!(g.status_lines(NOW, false).iter().any(|l| l.starts_with("Training: Run…\t2m left")));
+
+        let (secs, ev) = run(&mut g, TRAIN_SECS - 1, |g| !g.training());
+        assert_eq!(secs, TRAIN_SECS - 1, "still going");
+        assert!(g.training() && total(&g.pet.stats) == before && !ev.contains(&Event::Save));
+        assert!(g.status_lines(NOW, false).iter().any(|l| l.ends_with("1s left")));
+
+        let ev = g.second(NOW + TRAIN_SECS, true, false);
+        assert!(!g.training() && ev.contains(&Event::Save));
+        assert!(total(&g.pet.stats) > before, "news: {}", g.news);
+        assert!(g.allowed(CMD_TRAIN));
+    }
+
+    #[test]
+    fn a_drill_keeps_going_while_held() {
+        let mut g = game(Species::Raptin);
+        g.command(CMD_TRAIN, NOW);
+        for s in 1..=TRAIN_SECS {
+            g.second(NOW + s, false, false); // being held: `tick` doesn't run, `second` does
+        }
+        assert!(!g.training(), "the clock doesn't stop just because you picked it up");
+    }
+
+    #[test]
+    fn poop_can_be_cleaned_mid_drill_without_interrupting_it() {
+        let mut g = game(Species::Raptin);
+        g.pet.poops = vec![(1, 1), (2, 2)];
+        g.command(CMD_TRAIN, NOW);
+        assert!(g.clean_one(0), "clicking a poop works");
+        assert!(g.training());
+        let ev = g.command(CMD_CLEAN, NOW);
+        assert!(ev.contains(&Event::PoopsCleared) && g.pet.poops.is_empty());
+        assert!(g.training(), "and so does Clean up, without stopping the drill");
+    }
+
+    #[test]
+    fn a_long_gap_books_a_drill_in_progress() {
+        let mut g = game(Species::Raptin);
+        let before = total(&g.pet.stats);
+        g.command(CMD_TRAIN, NOW);
+        let ev = g.advance(NOW, NOW + 3600, true, false);
+        assert!(!g.training(), "the PC slept through the drill");
+        assert!(ev.contains(&Event::Save));
+        assert!(total(&g.pet.stats) > before);
+        assert!(g.news.starts_with("Run:"), "and you hear how it went: {}", g.news);
+    }
+
+    #[test]
+    fn retirement_waits_for_a_drill_to_finish() {
+        let mut g = game(Species::Raptin);
+        g.command(CMD_TRAIN, NOW);
+        g.pet.born = NOW - 60 * 86_400;
+        let before = total(&g.pet.stats);
+        assert!(!g.second(NOW, true, false).contains(&Event::Retire), "not mid-drill");
+        let (_, ev) = run(&mut g, TRAIN_SECS + 1, |g| g.retiring);
+        assert!(ev.contains(&Event::Retire), "once it's done");
+        assert!(total(&g.pet.stats) > before, "and the drill still counted: {}", g.news);
     }
 
     #[test]

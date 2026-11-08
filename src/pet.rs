@@ -24,6 +24,9 @@ pub const PLAY_SECS: u64 = 180;
 pub const PLAY_HAPPY: f32 = 50.0; // over a whole session; it stops once it's as happy as can be
 pub const PLAY_ENERGY: f32 = 8.0;
 pub const PLAY_FULL: f32 = 5.0;
+/// A drill takes this long, so training is something it gets on with while you work. It's paid
+/// for up front and pays out at the end.
+pub const TRAIN_SECS: u64 = 120;
 
 /// A meal or a play session.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1151,6 +1154,9 @@ Gen 9 · Nobodymon (Rookie) · stats 1/2/3/4/5 (total 15) #1
         let meals = (FULL_RATE * 3600.0 + 4.0 * 6.0 + plays * PLAY_FULL) / MEAL_FULL;
         let busy = meals * MEAL_SECS as f32 + plays * PLAY_SECS as f32;
         assert!(busy < 900.0, "{:.0} min of every hour spent on upkeep", busy / 60.0);
+        // The drills can't overlap with that, and they still have to fit with room to spare.
+        let total = busy + 4.0 * TRAIN_SECS as f32;
+        assert!(total < 1800.0, "{:.0} min of every hour spoken for", total / 60.0);
     }
 
     #[test]
