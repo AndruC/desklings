@@ -67,6 +67,7 @@ pub struct Pet {
     pub happy: f32,
     pub energy: f32,
     pub poops: Vec<(i32, i32)>, // screen positions of dropped poops
+    pub fence: Option<i32>,     // screen x of the fence post, if one is up; outlives the pet
     pub asleep: bool,
     pub next_poop: u64, // 0 = none pending
     pub mistakes: u32,
@@ -107,6 +108,7 @@ impl Pet {
             happy: 80.0,
             energy: 100.0,
             poops: Vec::new(),
+            fence: None,
             asleep: false,
             next_poop: 0,
             mistakes: 0,
@@ -131,6 +133,7 @@ impl Pet {
     pub fn successor_at(&self, now: u64) -> Pet {
         let mut p = Pet::new_at(self.seen, now);
         p.generation = self.generation.saturating_add(1);
+        p.fence = self.fence;
         for (s, parent) in p.stats.iter_mut().zip(self.stats) {
             *s += (parent / 10).min(50);
         }
@@ -411,7 +414,7 @@ impl Pet {
         format!(
             "born={}\nspecies={}\nstage_since={}\nstats={}\nfull={}\nhappy={}\nenergy={}\npoops={}\nasleep={}\n\
              next_poop={}\nmistakes={}\nflags={}\nwins={}\nlosses={}\nrank={}\nrank_wins={}\nseen={}\n\
-             generation={}\nlife_mod={}\ncare_day={}\nmistakes_mark={}\nwaited={}\nx={}\nsaved={}\n",
+             generation={}\nlife_mod={}\ncare_day={}\nmistakes_mark={}\nwaited={}\nfence={}\nx={}\nsaved={}\n",
             self.born,
             self.species.info().name,
             self.stage_since,
@@ -434,6 +437,7 @@ impl Pet {
             self.care_day,
             self.mistakes_mark,
             self.waited as u8,
+            self.fence.map(|f| f.to_string()).unwrap_or_default(),
             x,
             now
         )
@@ -491,6 +495,7 @@ impl Pet {
                     p.poops.truncate(MAX_POOPS);
                 }
                 "asleep" => p.asleep = val::<u8>(k, v)? != 0,
+                "fence" => p.fence = if v.is_empty() { None } else { Some(val(k, v)?) },
                 "next_poop" => p.next_poop = val(k, v)?,
                 "mistakes" => p.mistakes = val(k, v)?,
                 "flags" => {
@@ -716,6 +721,7 @@ mod tests {
         p.happy = 77.0;
         p.energy = 31.0;
         p.poops = vec![(100, 200), (-50, 1300)];
+        p.fence = Some(-420);
         p.asleep = true;
         p.next_poop = NOW + 99;
         p.mistakes = 2;
@@ -742,6 +748,11 @@ mod tests {
         assert_eq!((b.species, b.stats, b.wins, b.rank, b.generation), (Species::Mystifur, [70, 50, 60, 90, 140], 7, 2, 4));
         assert_eq!((b.poops.clone(), b.asleep, b.starving, b.sulking, b.life_mod, b.seen), (vec![(100, 200), (-50, 1300)], true, true, true, -3600, 0b1011));
         assert_eq!((b.rank_wins, b.mistakes, b.mistakes_mark, b.care_day, b.losses, b.next_poop), (2, 2, 2, 3, 3, NOW + 99));
+        assert_eq!(b.fence, Some(-420));
+        let no_fence = Pet { fence: None, ..sample() };
+        assert_eq!(Pet::parse(&no_fence.serialize(0.0, NOW), NOW).unwrap().0.fence, None);
+        assert!(Pet::parse(&a.serialize(0.0, NOW).replace("fence=-420", "fence=x"), NOW).is_err(), "a garbled fence is damage");
+        assert_eq!(a.successor_at(NOW).fence, Some(-420), "the fence stays up for the next generation");
     }
 
     #[test]

@@ -21,7 +21,7 @@ for m in re.finditer(r'pub const (\w+): Sprite = &\[(.*?)\];', src, re.S):
 VALID = set('.kwbdahepronygcs')
 ICONS = {'HEART', 'MEAT', 'ZZZ', 'BANG', 'STAR', 'UP', 'SWEAT', 'SHOE', 'DUMBBELL', 'SHIELD', 'BOOK', 'WAVE', 'SWORD'}
 # Largest size each sprite may be (width, height); keep in sync with sprites_are_well_formed in monster.rs.
-LIMITS = {**{n: (7, 7) for n in ICONS}, 'POOP': (8, 6)}
+LIMITS = {**{n: (7, 7) for n in ICONS}, 'POOP': (8, 6), 'FENCE': (5, 11)}
 for n in ('EGG', 'BLIP_A', 'BLIP_B', 'BLOP', 'RAPTIN', 'FLUFFIN', 'SHELLBY'):
     LIMITS[n] = (16, 16)
 for n in ('PYROREX', 'CRAGDON', 'GALEWING', 'MYSTIFUR', 'BULWARK', 'TIDECREST', 'GRUMBLOO'):

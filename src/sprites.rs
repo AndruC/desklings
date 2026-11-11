@@ -499,3 +499,20 @@ pub const POOP: Sprite = &[
     "knnnnnnk",
     "kkkkkkkk",
 ];
+
+// ---------------------------------------------------------------- props
+
+/// A fence post you can drag around; the monster won't walk past it.
+pub const FENCE: Sprite = &[
+    "..k..",
+    ".knk.",
+    "kknkk",
+    "nnsnn",
+    "kknkk",
+    ".knk.",
+    "kknkk",
+    "nnsnn",
+    "kknkk",
+    ".knk.",
+    "gkkkg",
+];

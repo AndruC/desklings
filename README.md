@@ -67,8 +67,9 @@ A champion fights with the next rank's total, so it's a real step up. Lose and i
 |---|---|
 | Left-click | Pet it |
 | Drag | Pick it up and move it |
-| Right-click | Stats and actions: Feed, Train, Battle, Play, Clean up, Lights out, Evolution guide, Hall of Fame, Retire, Start over, Quit |
+| Right-click | Stats and actions: Feed, Train, Battle, Play, Clean up, Lights out, Put up a fence, Evolution guide, Hall of Fame, Retire, Start over, Quit |
 | Click a poop | Clean it up |
+| Drag the fence post | Move the fence. Your monster stays between the post and the edge of the screen. Take it down from the menu |
 
 ## Building
 

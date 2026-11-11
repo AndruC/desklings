@@ -47,6 +47,7 @@ const WM_RETIRE: u32 = WM_APP + 1;
 
 const POOP_CLASS: &str = "DesklingsPoop";
 const FOE_CLASS: &str = "DesklingsFoe";
+const FENCE_CLASS: &str = "DesklingsFence";
 
 const INK: u32 = 0xFF1A1A2E;
 const WHITE: u32 = 0xFFFFFFFF;
@@ -208,6 +209,38 @@ impl FoeView {
     }
 }
 
+/// The fence post, while it's up. Its x is mirrored in `game.pet.fence` so it's saved.
+struct Post {
+    x: f32,
+    y: f32,
+    vy: f32,
+    held: Option<(i32, i32)>, // grab offset x/y while it's being dragged
+}
+
+/// Narrows the buddy's range of window x positions `lo..=hi` so that its body (`body`: offsets
+/// from the window's x to the body's left and right edges) stays on its own side of a post
+/// covering screen columns `post`. If there's no room on its own side it goes to the other.
+fn fenced(lo: f32, hi: f32, x: f32, body: (f32, f32), post: (f32, f32)) -> (f32, f32) {
+    let left_max = post.0 - body.1; // furthest it can go while left of the post
+    let right_min = post.1 - body.0; // ...or the least while right of it
+    let (left_ok, right_ok) = (left_max >= lo, right_min <= hi);
+    if left_max >= hi || right_min <= lo || !(left_ok || right_ok) {
+        return (lo, hi); // the post is out of reach, or the screen is too narrow to fence off
+    }
+    let on_left = x + (body.0 + body.1) / 2.0 < (post.0 + post.1) / 2.0;
+    if (on_left && left_ok) || !right_ok { (lo, left_max) } else { (right_min, hi) }
+}
+
+/// The opaque columns a sprite spans in either facing, as (first, one past last).
+fn opaque_cols(spr: Sprite) -> (i32, i32) {
+    let w = sprite_width(spr);
+    let solid = |c: i32| spr.iter().any(|r| r.as_bytes().get(c as usize).is_some_and(|&b| b != b'.'));
+    let first = (0..w).find(|&c| solid(c)).unwrap_or(0);
+    let last = (0..w).rev().find(|&c| solid(c)).unwrap_or(w - 1);
+    let margin = first.min(w - 1 - last); // mirroring swaps the margins, so take the thinner
+    (margin, w - margin)
+}
+
 /// The Windows side: windows, drawing, physics and input. The rules live in `Game`.
 struct App {
     game: Game,
@@ -218,6 +251,9 @@ struct App {
     foe_hwnd: HWND,
     foe_canvas: Surface,
     foe: Option<FoeView>,
+    fence_hwnd: HWND,
+    fence_gfx: Surface,
+    post: Option<Post>,
     x: f32,
     y: f32,
     vy: f32,
@@ -356,13 +392,23 @@ impl App {
             self.handle(ev);
         }
 
+        self.fence_tick();
         if self.held.is_none() {
             let s = scale() as f32;
             let wa = work_area(self.hwnd);
             let ground = (wa.bottom - ch()) as f32;
-            let half = sprite_width(self.current_sprite()) / 2;
+            let spr = self.current_sprite();
+            let half = sprite_width(spr) / 2;
             let min_x = (wa.left - (CX - half) * scale()) as f32;
             let max_x = ((wa.right - cw()) as f32).max(min_x); // keep the bubble on screen too
+            let (min_x, max_x) = match self.post_span() {
+                Some(post) => {
+                    let (l, r) = opaque_cols(spr);
+                    let body = ((CX - half + l) as f32 * s, (CX - half + r) as f32 * s);
+                    fenced(min_x, max_x, self.x, body, post)
+                }
+                None => (min_x, max_x),
+            };
 
             if self.y < ground || self.vy < 0.0 {
                 self.grounded = false;
@@ -407,7 +453,18 @@ impl App {
         let wa = work_area(self.hwnd);
         let ground = (wa.bottom - ch()) as f32;
         let mid = (wa.left + wa.right) as f32 / 2.0;
-        let side = if self.x + CX as f32 * s < mid { 1 } else { -1 };
+        let centre = self.x + CX as f32 * s;
+        let mut side = if centre < mid { 1 } else { -1 };
+        // If the fence is in the way, the foe comes from the other side, if there's room there.
+        let reach = 45.0 * s;
+        let blocked = self.post_span().is_some_and(|(l, r)| {
+            let gap = ((l + r) / 2.0 - centre) * side as f32;
+            gap > 0.0 && gap < reach
+        });
+        let room = centre - side as f32 * reach;
+        if blocked && room > wa.left as f32 && room < wa.right as f32 {
+            side = -side;
+        }
         // Foe stands 35 art px away, with its bubble on the far side from the buddy.
         self.foe_canvas.cx = if side > 0 { CX } else { LW - 1 - CX };
         let target = self.x + (CX + side * 35 - self.foe_canvas.cx) as f32 * s;
@@ -420,6 +477,91 @@ impl App {
         unsafe {
             ShowWindow(self.foe_hwnd, SW_SHOWNOACTIVATE);
             SetWindowPos(self.hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        }
+    }
+
+    // ------------------------------------------------------------------ fence
+
+    /// The screen columns the post covers, if it's up on the buddy's monitor.
+    fn post_span(&self) -> Option<(f32, f32)> {
+        let p = self.post.as_ref()?;
+        let same_screen = unsafe {
+            MonitorFromWindow(self.fence_hwnd, MONITOR_DEFAULTTONEAREST) == MonitorFromWindow(self.hwnd, MONITOR_DEFAULTTONEAREST)
+        };
+        same_screen.then(|| (p.x, p.x + self.fence_gfx.size().0 as f32))
+    }
+
+    /// Puts the post up at screen (x, y); it falls to the taskbar from there.
+    fn place_fence(&mut self, x: i32, y: i32) {
+        self.post = Some(Post { x: x as f32, y: y as f32, vy: 0.0, held: None });
+        self.game.pet.fence = Some(x);
+        self.fence_gfx.present(self.fence_hwnd, x, y);
+        unsafe {
+            ShowWindow(self.fence_hwnd, SW_SHOWNOACTIVATE);
+            // The buddy stands in front of its fence.
+            SetWindowPos(self.hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        }
+    }
+
+    fn toggle_fence(&mut self) {
+        if self.post.take().is_some() {
+            self.game.pet.fence = None;
+            unsafe { ShowWindow(self.fence_hwnd, SW_HIDE) };
+        } else {
+            // A little way from the buddy towards the middle of the screen, dropped from above.
+            let s = scale();
+            let wa = work_area(self.hwnd);
+            let centre = self.x as i32 + CX * s;
+            let side = if centre < (wa.left + wa.right) / 2 { 1 } else { -1 };
+            let (w, h) = self.fence_gfx.size();
+            self.place_fence(centre + side * 30 * s - w / 2, wa.bottom - h - 40 * s);
+        }
+        self.persist();
+    }
+
+    /// Lets the post fall to the taskbar when it isn't being held, keeping it on screen.
+    fn fence_tick(&mut self) {
+        let Some(p) = self.post.as_mut() else { return };
+        if p.held.is_some() {
+            return;
+        }
+        let (w, h) = self.fence_gfx.size();
+        let wa = work_area(self.fence_hwnd);
+        let ground = (wa.bottom - h) as f32;
+        let (x0, y0) = (p.x, p.y);
+        if p.y < ground {
+            p.vy += 0.375 * scale() as f32;
+            p.y += p.vy;
+        }
+        if p.y >= ground {
+            p.y = ground;
+            p.vy = 0.0;
+        }
+        p.x = p.x.clamp(wa.left as f32, (wa.right - w).max(wa.left) as f32);
+        if (p.x, p.y) != (x0, y0) {
+            self.game.pet.fence = Some(p.x as i32);
+            self.fence_gfx.present(self.fence_hwnd, p.x as i32, p.y as i32);
+        }
+    }
+
+    fn grab_fence(&mut self, c: POINT) -> bool {
+        let Some(p) = self.post.as_mut() else { return false };
+        p.held = Some((c.x - p.x as i32, c.y - p.y as i32));
+        p.vy = 0.0;
+        true
+    }
+
+    fn drag_fence(&mut self, c: POINT) {
+        let Some(p) = self.post.as_mut() else { return };
+        let Some((gx, gy)) = p.held else { return };
+        (p.x, p.y) = ((c.x - gx) as f32, (c.y - gy) as f32);
+        self.game.pet.fence = Some(p.x as i32);
+        self.fence_gfx.present(self.fence_hwnd, p.x as i32, p.y as i32);
+    }
+
+    fn drop_fence(&mut self) {
+        if self.post.as_mut().and_then(|p| p.held.take()).is_some() {
+            self.persist();
         }
     }
 
@@ -592,6 +734,7 @@ struct MenuState {
     enabled: Vec<i32>,
     asleep: bool,
     battle: String,
+    fenced: bool,
     born: u64, // identifies the pet, so a confirmation box can't act on its successor
 }
 
@@ -603,6 +746,7 @@ fn show_menu(hwnd: HWND) {
             enabled: (CMD_FEED..=CMD_LAST).filter(|&c| g.allowed(c)).collect(),
             asleep: g.pet.asleep,
             battle: g.battle_label(),
+            fenced: a.post.is_some(),
             born: g.pet.born,
         }
     }) else {
@@ -631,6 +775,8 @@ fn show_menu(hwnd: HWND) {
         AppendMenuW(m, MF_STRING | gray(CMD_CLEAN), CMD_CLEAN as usize, wide("Clean up").as_ptr());
         let sleep_lbl = if st.asleep { "Wake up" } else { "Lights out" };
         AppendMenuW(m, MF_STRING | gray(CMD_SLEEP), CMD_SLEEP as usize, wide(sleep_lbl).as_ptr());
+        let fence_lbl = if st.fenced { "Take down the fence" } else { "Put up a fence" };
+        AppendMenuW(m, MF_STRING, CMD_FENCE as usize, wide(fence_lbl).as_ptr());
         AppendMenuW(m, MF_SEPARATOR, 0, null());
         AppendMenuW(m, MF_STRING, CMD_GUIDE as usize, wide("Evolution guide…").as_ptr());
         AppendMenuW(m, MF_STRING, CMD_HALL as usize, wide("Hall of Fame…").as_ptr());
@@ -699,6 +845,9 @@ fn run_command(hwnd: HWND, cmd: i32, born: u64) {
                     }
                 });
             }
+        }
+        CMD_FENCE => {
+            with_app(|a| a.toggle_fence());
         }
         CMD_RESET => {
             let ok = unsafe {
@@ -842,6 +991,41 @@ unsafe extern "system" fn poop_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
     }
 }
 
+/// The fence post: drag it anywhere and it drops to the taskbar. The buddy won't walk past it.
+unsafe extern "system" fn fence_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    match msg {
+        WM_MOUSEACTIVATE => MA_NOACTIVATE as LRESULT,
+        WM_LBUTTONDOWN => {
+            let c = cursor();
+            if with_app(|a| a.grab_fence(c)) == Some(true) {
+                SetCapture(hwnd);
+            }
+            0
+        }
+        WM_MOUSEMOVE => {
+            let c = cursor();
+            with_app(|a| a.drag_fence(c));
+            0
+        }
+        WM_LBUTTONUP => {
+            with_app(|a| a.drop_fence());
+            ReleaseCapture();
+            0
+        }
+        WM_CAPTURECHANGED => {
+            with_app(|a| a.drop_fence());
+            0
+        }
+        WM_RBUTTONUP => {
+            if let Some(pet) = with_app(|a| a.hwnd) {
+                show_menu(pet);
+            }
+            0
+        }
+        _ => DefWindowProcW(hwnd, msg, wp, lp),
+    }
+}
+
 /// The wild opponent during a battle. Purely visual.
 unsafe extern "system" fn foe_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match msg {
@@ -882,6 +1066,7 @@ fn main() {
         let class = wide("DesklingsBuddy");
         let poop_class = wide(POOP_CLASS);
         let foe_class = wide(FOE_CLASS);
+        let fence_class = wide(FENCE_CLASS);
         let mut wc: WNDCLASSW = std::mem::zeroed();
         wc.hInstance = hinst;
         wc.hCursor = LoadCursorW(null_mut(), IDC_HAND);
@@ -889,6 +1074,7 @@ fn main() {
             (&class, wndproc as unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT),
             (&poop_class, poop_wndproc),
             (&foe_class, foe_wndproc),
+            (&fence_class, fence_wndproc),
         ] {
             wc.lpfnWndProc = Some(proc_);
             wc.lpszClassName = name.as_ptr();
@@ -897,17 +1083,22 @@ fn main() {
 
         let hwnd = popup(&class, hinst, cw(), ch());
         let foe_hwnd = popup(&foe_class, hinst, cw(), ch());
-        if hwnd.is_null() || foe_hwnd.is_null() {
+        let fence_hwnd = popup(&fence_class, hinst, sprite_width(FENCE) * scale(), FENCE.len() as i32 * scale());
+        if hwnd.is_null() || foe_hwnd.is_null() || fence_hwnd.is_null() {
             return;
         }
 
-        // Poop art never changes, so draw it once and reuse it for every poop window.
-        let (Some(mut poop_gfx), Some(canvas), Some(foe_canvas)) =
-            (Surface::new(POOP[0].len() as i32, POOP.len() as i32), Surface::new(LW, LH), Surface::new(LW, LH))
-        else {
+        // Poop and fence art never change, so draw them once and reuse them.
+        let (Some(mut poop_gfx), Some(mut fence_gfx), Some(canvas), Some(foe_canvas)) = (
+            Surface::new(POOP[0].len() as i32, POOP.len() as i32),
+            Surface::new(sprite_width(FENCE), FENCE.len() as i32),
+            Surface::new(LW, LH),
+            Surface::new(LW, LH),
+        ) else {
             return;
         };
         poop_gfx.blit(POOP, 0, 0, false, Pal::default(), false, false);
+        fence_gfx.blit(FENCE, 0, 0, false, Pal::default(), false, false);
 
         let wa = work_area(hwnd);
         let (pet, saved_x, warning) = match Pet::load() {
@@ -936,6 +1127,9 @@ fn main() {
             foe_hwnd,
             foe_canvas,
             foe: None,
+            fence_hwnd,
+            fence_gfx,
+            post: None,
             x: saved_x.unwrap_or((wa.right - cw() - 200) as f32),
             y: (wa.bottom - ch() - 150) as f32, // drop in from a little above the taskbar
             vy: 0.0,
@@ -952,6 +1146,9 @@ fn main() {
                 app.game.pet.poops.push(landed);
             }
         }
+        if let Some(fx) = app.game.pet.fence {
+            app.place_fence(fx, wa.bottom - app.fence_gfx.size().1);
+        }
         app.render();
         APP.with(|a| *a.borrow_mut() = Some(app));
 
@@ -963,5 +1160,39 @@ fn main() {
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const BODY: (f32, f32) = (10.0, 30.0); // body spans window x + 10 .. x + 30
+
+    #[test]
+    fn fence_keeps_the_buddy_on_its_own_side() {
+        // Screen allows x in 0..=500; post covers 200..220.
+        assert_eq!(fenced(0.0, 500.0, 50.0, BODY, (200.0, 220.0)), (0.0, 170.0), "left of the post");
+        assert_eq!(fenced(0.0, 500.0, 300.0, BODY, (200.0, 220.0)), (210.0, 500.0), "right of the post");
+    }
+
+    #[test]
+    fn fence_out_of_reach_changes_nothing() {
+        assert_eq!(fenced(0.0, 500.0, 50.0, BODY, (900.0, 920.0)), (0.0, 500.0));
+        assert_eq!(fenced(0.0, 500.0, 50.0, BODY, (-900.0, -880.0)), (0.0, 500.0));
+    }
+
+    #[test]
+    fn no_room_beside_the_post_means_the_other_side() {
+        // Post hard against the left edge: a buddy standing in it goes right, never into a bad range.
+        assert_eq!(fenced(0.0, 500.0, 0.0, BODY, (5.0, 25.0)), (15.0, 500.0));
+        let (lo, hi) = fenced(0.0, 500.0, 500.0, BODY, (505.0, 535.0));
+        assert!(lo <= hi, "f32::clamp panics on an inverted range");
+    }
+
+    #[test]
+    fn opaque_cols_take_the_thinner_margin() {
+        assert_eq!(opaque_cols(&["..kk....", "...k...."]), (2, 6));
+        assert_eq!(opaque_cols(FENCE), (0, 5));
     }
 }

@@ -16,6 +16,7 @@ pub const CMD_BATTLE: i32 = 7;
 pub const CMD_GUIDE: i32 = 8;
 pub const CMD_HALL: i32 = 9;
 pub const CMD_RETIRE: i32 = 10;
+pub const CMD_FENCE: i32 = 11; // put up or take down the fence post (the shell's; no rules involved)
 pub const CMD_TRAIN: i32 = 20; // + drill index
 pub const CMD_LAST: i32 = CMD_TRAIN + Drill::ALL.len() as i32 - 1;
 
@@ -191,7 +192,7 @@ impl Game {
             CMD_SLEEP => p.stage() != Stage::Egg && !scene,
             CMD_RETIRE => !scene && p.stage() >= Stage::Rookie,
             CMD_RESET => !scene,
-            CMD_GUIDE | CMD_HALL | CMD_QUIT => true,
+            CMD_GUIDE | CMD_HALL | CMD_QUIT | CMD_FENCE => true,
             _ => false,
         }
     }
@@ -396,12 +397,12 @@ impl Game {
             CMD_RESET => {
                 self.pet.poops.clear();
                 ev.push(Event::PoopsCleared);
-                self.pet = Pet::new_at(self.pet.seen, now);
+                self.pet = Pet { fence: self.pet.fence, ..Pet::new_at(self.pet.seen, now) };
                 self.care = None;
                 self.news.clear();
                 self.set_act(Act::Idle, 20);
             }
-            _ => return ev, // Quit, Guide, Hall and Retire are the shell's (they need dialogs)
+            _ => return ev, // Quit, Guide, Hall, Retire and Fence are the shell's
         }
         ev.push(Event::Save);
         ev
@@ -842,6 +843,19 @@ mod tests {
             assert!(!g.allowed(c), "cmd {c} allowed mid-battle");
         }
         assert!(g.allowed(CMD_QUIT) && g.allowed(CMD_GUIDE));
+    }
+
+    #[test]
+    fn the_fence_outlasts_the_pet() {
+        let mut g = game(Species::Raptin);
+        g.pet.fence = Some(300);
+        assert!(g.allowed(CMD_FENCE));
+        assert!(g.command(CMD_FENCE, NOW).is_empty(), "the shell handles the fence itself");
+        g.command(CMD_RESET, NOW);
+        assert_eq!((g.pet.species, g.pet.fence), (Species::Egg, Some(300)), "starting over keeps the fence up");
+        g.pet.species = Species::Raptin;
+        g.retire(true, NOW);
+        assert_eq!(g.pet.fence, Some(300), "so does retiring");
     }
 
     #[test]

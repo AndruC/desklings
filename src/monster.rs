@@ -659,6 +659,7 @@ mod tests {
             check("icon", icon, (7, 7));
         }
         check("POOP", POOP, (8, 6));
+        check("FENCE", FENCE, (5, 11));
     }
 
     #[test]
